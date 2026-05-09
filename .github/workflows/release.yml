@@ -104,6 +104,12 @@ jobs:
       - name: Configure & build (alpine/musl)
         if: matrix.builder == 'alpine'
         run: |
+          # `--without-bash-malloc' is required on musl: bash's
+          # bundled malloc (lib/malloc/malloc.c) makes platform
+          # assumptions that aren't met on musl, and the resulting
+          # binary aborts with `xmalloc: locale.c:90: cannot
+          # allocate 18 bytes' as soon as setlocale() runs. Using
+          # the system (musl) malloc avoids the issue cleanly.
           docker run --rm \
             -v "$PWD":/src -w /src \
             --platform linux/amd64 \
@@ -111,7 +117,7 @@ jobs:
               set -e
               apk add --no-cache build-base bison
               touch aclocal.m4 configure.ac configure
-              ./configure --quiet
+              ./configure --quiet --without-bash-malloc
               make -j$(nproc)
               ls -la bash
             '
