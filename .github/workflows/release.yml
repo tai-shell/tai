@@ -1,0 +1,109 @@
+name: Release
+
+# Tagged release workflow. On any push to a `v*` tag, build the tai
+# bash binary for each supported platform and publish a GitHub
+# Release with the assets attached. Tag PEP-440 pre-release suffixes
+# (a / b / rc) get marked as pre-releases automatically.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required for softprops/action-gh-release to upload assets
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is Apple Silicon; produces an arm64-only binary.
+          # Intel-Mac users (universal2) is a follow-up — not all bash
+          # build steps cleanly support multi-arch out of the box, so
+          # for v1 we ship arm64 and document the limitation.
+          - runner: macos-14
+            target: macos-arm64
+            artifact: tai-macos-arm64
+          - runner: ubuntu-latest
+            target: linux-x86_64
+            artifact: tai-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS GitHub runners ship Apple's ancient `bison 2.3', which
+      # is too old to process bash 5.3's parse.y (it pre-dates the
+      # `YYEOF' token reference and bails with `symbol YYEOF is used,
+      # but is not defined as a token and has no rules'). Install
+      # Homebrew's modern bison and put it at the front of PATH.
+      - name: Install modern bison (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison
+          BISON_DIR="$(brew --prefix bison)/bin"
+          echo "${BISON_DIR}" >> "$GITHUB_PATH"
+          "${BISON_DIR}/bison" --version | head -1
+
+      - name: Verify bison version
+        run: bison --version | head -1
+
+      - name: Configure & build
+        run: |
+          ./configure --quiet
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            make -j$(sysctl -n hw.ncpu)
+          else
+            make -j$(nproc)
+          fi
+          ls -la bash
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          cp bash "out/${{ matrix.artifact }}"
+          chmod +x "out/${{ matrix.artifact }}"
+          file "out/${{ matrix.artifact }}"
+          "./out/${{ matrix.artifact }}" --version
+          # Smoke test: arithmetic + a simple `for' loop.
+          "./out/${{ matrix.artifact }}" -c 'echo 1+1=$((1+1)); for i in 1 2 3; do echo iter $i; done'
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p assets
+          find artifacts -type f -exec cp {} assets/ \;
+          ls -la assets/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Auto-flag tags with PEP 440 pre-release suffixes (e.g.
+          # v0.1.0a1, v0.1.0b2, v0.1.0rc1) as pre-releases. Stable
+          # tags (v0.1.0, v1.0.0) get marked stable.
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
