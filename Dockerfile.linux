@@ -1,0 +1,25 @@
+# Linux build environment for tai (forked bash).
+#
+# Used by `make -f Makefile.tai linux` to produce a Linux bash binary from
+# a non-Linux host. The container does not bake the source in — it expects
+# the repo to be bind-mounted at /src. Subsequent runs reuse the cached
+# image.
+#
+#   docker buildx build --platform linux/amd64 -f Dockerfile.linux -t tai-bash-build .
+#   docker run --rm -v $PWD:/src -w /src/build-linux --platform linux/amd64 \
+#       tai-bash-build bash -c '../configure --quiet && make -j$(nproc)'
+#
+# Build deps are intentionally minimal — bash 5.3 ships a pre-generated
+# configure script, so we do not need autoconf / automake here. Add
+# autoconf, m4, etc. only if the fork modifies configure.ac.
+
+FROM ubuntu:22.04
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        build-essential \
+        bison \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

@@ -66,3 +66,6 @@ configure.lineno
 /stdckdint.h
 /syntax.c
 /version.h
+
+# Out-of-tree build directories used by Makefile.tai (linux, etc.)
+/build-*/
