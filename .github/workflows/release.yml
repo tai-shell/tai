@@ -23,12 +23,19 @@ jobs:
       matrix:
         include:
           # macos-14 is Apple Silicon; produces an arm64-only binary.
-          # Intel-Mac users (universal2) is a follow-up — not all bash
-          # build steps cleanly support multi-arch out of the box, so
-          # for v1 we ship arm64 and document the limitation.
           - runner: macos-14
             target: macos-arm64
             artifact: tai-macos-arm64
+          # macos-13 is the last GitHub-hosted Intel Mac runner.
+          # Slower queue than macos-14 but reliable for C builds —
+          # bash's configure does not cross-compile cleanly without
+          # a pre-baked cross-build cache, so we use a real Intel
+          # runner instead of cross-arch flags. Universal2 (one fat
+          # binary) is a follow-up if/when bash 5.3's configure +
+          # generated-program build steps grow multi-arch support.
+          - runner: macos-13
+            target: macos-x86_64
+            artifact: tai-macos-x86_64
           - runner: ubuntu-latest
             target: linux-x86_64
             artifact: tai-linux-x86_64
