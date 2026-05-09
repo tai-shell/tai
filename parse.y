@@ -319,6 +319,13 @@ static int eol_ungetc_lookahead = 0;
 static int simplecmd_lineno = -1;
 static int save_simple_lineno = -1;
 
+#if defined (AGENT_DISPATCH)
+/* parse_at_dispatch returns AT_DISPATCH with the prompt as
+   yylval.word; the matching pool selector (if any) is parked here
+   for the agent_dispatch_command grammar action to pick up. */
+static WORD_DESC *agent_pending_selector = (WORD_DESC *)NULL;
+#endif
+
 /* The line number in a script on which a function definition starts. */
 static int function_dstart;
 static int save_dstart = -1;
@@ -1219,7 +1226,11 @@ cond_command:	COND_START COND_CMD COND_END
 	;
 
 agent_dispatch_command: AT_DISPATCH
-			{ $$ = make_agent_dispatch_command ($1, line_number); }
+			{
+			  WORD_DESC *sel = agent_pending_selector;
+			  agent_pending_selector = (WORD_DESC *)NULL;
+			  $$ = make_agent_dispatch_command (sel, $1, line_number);
+			}
 	;
 
 elif_clause:	ELIF compound_list THEN compound_list
@@ -4980,75 +4991,145 @@ parse_dparen (int c)
 }
 
 #if defined (AGENT_DISPATCH)
+/* Helpers used by parse_at_dispatch. */
+
+/* Append CH to BUF (size *ALLOC, used INDX); grow BUF if needed.
+   Updates *INDX and *ALLOC.  *BUFP must have been malloc'd. */
+static void
+agent_buf_append (char **bufp, size_t *indxp, size_t *allocp, int ch)
+{
+  if (*indxp + 1 >= *allocp)
+    {
+      *allocp *= 2;
+      *bufp = (char *)xrealloc (*bufp, *allocp);
+    }
+  (*bufp)[(*indxp)++] = ch;
+}
+
+/* Skip blanks (spaces and tabs) in the lexer input. */
+static int
+agent_skip_blanks (void)
+{
+  int ch;
+  do
+    ch = shell_getc (1);
+  while (ch == ' ' || ch == '\t');
+  return ch;
+}
+
 /* tai agent-dispatch operator. The lexer has just consumed `@' at
-   command-start position. Read the rest of the current input line
-   from the lexer's buffered input via shell_getc(), package it as
-   a WORD_DESC, and emit AT_DISPATCH so the grammar reduces it into
-   an agent-dispatch command. The trailing newline is pushed back so
-   the parser sees the simple_list_terminator.
+   command-start position. Captures:
 
-   v0 behavior: the entire post-@ line (after leading blanks) becomes
-   the prompt verbatim; selector-pool parsing, /done sentinels, and
-   `else' actions are not yet split out. Future work: parse `{sel}'
-   / `[sel]', extract trailing `/done', recognize `else <action>'.
+     1. An optional pool selector — `{...}' or `[...]', verbatim
+        with brackets, depth-tracked so nested brackets balance.
+        v0 does not yet honour quoting inside the selector, so
+        literal `}' / `]' inside a quoted attribute value would be
+        mis-counted; that is rare in practice and lands here in a
+        later step.
+     2. The prompt body — everything from after the selector (or
+        from immediately after `@' when no selector is present) to
+        the next unquoted `;', `\n', or EOF. Trailing newline / `;'
+        is pushed back so the parser still sees the
+        simple_list_terminator.
 
-   Note: read_a_line() reads via yy_getc (raw input stream) and
-   would see EOF here because the lexer's shell_getc has already
-   pulled the line into shell_input_line. shell_getc() is the right
-   reader.
+   Both pieces are stored as separate WORD_DESCs and packaged into
+   yylval (an inline two-pointer struct via a yacc-side helper).
+   See docs/pool-dispatch-operator.md.
+
+   Set TAI_DEBUG=1 for a stderr trace of what was captured.
 
    Returns -2 to fall back to ordinary word lexing (reserved for
-   future "this isn't really a dispatch" cases like `@@' or `@(' if
-   those grow special meaning). Set TAI_DEBUG=1 for a stderr trace
-   of what was captured. */
+   future cases like `@@' or `@(' if those grow special meaning). */
 static int
 parse_at_dispatch (int c)
 {
-  char *line, *p;
-  size_t indx, alloc;
-  int ch;
-  WORD_DESC *wd;
+  char *sel_buf, *prompt_buf;
+  size_t sel_indx, sel_alloc, prompt_indx, prompt_alloc;
+  int ch, opener, closer, depth;
+  WORD_DESC *sel_wd, *prompt_wd;
 
-  alloc = 64;
-  indx = 0;
-  line = (char *)xmalloc (alloc);
+  sel_buf = prompt_buf = NULL;
+  sel_indx = prompt_indx = 0;
+  sel_alloc = prompt_alloc = 0;
 
-  /* v0: stop at any unquoted command terminator. We do not yet honour
-     bash's full quoting / heredoc / process-substitution rules, so
-     prompts that need to contain literal `;', `\n' etc. must be
-     escaped with backslash. Future work folds this into bash's real
-     word-lexer machinery. */
-  for (;;)
+  /* Skip whitespace between `@' and the selector / prompt. */
+  ch = agent_skip_blanks ();
+
+  /* Optional selector pool. */
+  if (ch == '{' || ch == '[')
     {
-      ch = shell_getc (1);
-      if (ch == EOF || ch == '\n' || ch == ';')
-	break;
-      if (indx + 1 >= alloc)
-	{
-	  alloc *= 2;
-	  line = (char *)xrealloc (line, alloc);
-	}
-      line[indx++] = ch;
-    }
-  line[indx] = '\0';
+      opener = ch;
+      closer = (ch == '{') ? '}' : ']';
+      depth = 1;
+      sel_alloc = 32;
+      sel_buf = (char *)xmalloc (sel_alloc);
+      agent_buf_append (&sel_buf, &sel_indx, &sel_alloc, opener);
 
-  /* Push the terminator back so the parser still sees it as the
-     simple_list_terminator (or list separator inside a compound
-     command body). EOF is left consumed; yylex synthesizes
-     yacc_EOF on the next call. */
+      for (;;)
+	{
+	  ch = shell_getc (1);
+	  if (ch == EOF || ch == '\n')
+	    {
+	      /* Unterminated selector. v0: emit a parse error by
+	         pushing the terminator back and treating what we
+	         captured so far as the prompt. Future: report a real
+	         syntax error. */
+	      if (ch != EOF)
+		shell_ungetc (ch);
+	      free (sel_buf);
+	      sel_buf = NULL;
+	      break;
+	    }
+	  agent_buf_append (&sel_buf, &sel_indx, &sel_alloc, ch);
+	  if (ch == opener)
+	    depth++;
+	  else if (ch == closer)
+	    {
+	      depth--;
+	      if (depth == 0)
+		break;
+	    }
+	}
+      if (sel_buf)
+	{
+	  sel_buf[sel_indx] = '\0';
+	  /* Skip blanks between selector and prompt. */
+	  ch = agent_skip_blanks ();
+	}
+    }
+
+  /* Prompt body — everything to next unquoted command terminator. */
+  prompt_alloc = 64;
+  prompt_buf = (char *)xmalloc (prompt_alloc);
+  while (ch != EOF && ch != '\n' && ch != ';')
+    {
+      agent_buf_append (&prompt_buf, &prompt_indx, &prompt_alloc, ch);
+      ch = shell_getc (1);
+    }
+  prompt_buf[prompt_indx] = '\0';
+
+  /* Push the terminator back so the parser sees the
+     simple_list_terminator / list separator. */
   if (ch != EOF)
     shell_ungetc (ch);
 
-  for (p = line; *p == ' ' || *p == '\t'; p++)
-    ;
-
   if (getenv ("TAI_DEBUG"))
-    fprintf (stderr, "tai: agent-dispatch capture at line %d: %s\n",
-	     line_number, p);
+    fprintf (stderr, "tai: agent-dispatch at line %d: sel=%s prompt=%s\n",
+	     line_number,
+	     sel_buf ? sel_buf : "(none)",
+	     prompt_buf);
 
-  wd = make_word (p);
-  free (line);
-  yylval.word = wd;
+  sel_wd = sel_buf ? make_word (sel_buf) : (WORD_DESC *)NULL;
+  prompt_wd = make_word (prompt_buf);
+  free (sel_buf);
+  free (prompt_buf);
+
+  /* Stash both pieces. The grammar action assembles them into the
+     real AGENT_DISPATCH_COM via make_agent_dispatch_command(). We
+     piggy-back the selector through a static slot the action picks
+     up after AT_DISPATCH reduces. */
+  agent_pending_selector = sel_wd;
+  yylval.word = prompt_wd;
   return AT_DISPATCH;
 }
 #endif

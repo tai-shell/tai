@@ -341,13 +341,17 @@ typedef struct cond_com {
 } COND_COM;
 
 #if defined (AGENT_DISPATCH)
-/* The "agent dispatch" command — `@ {selector} prompt /done'. v0
-   stub: just holds the captured prompt as a single word. v1 will
-   split into selector_pool, prompt, sentinel, else_action.  See
-   docs/pool-dispatch-operator.md. */
+/* The "agent dispatch" command — `@ {selector} prompt /done'.
+   selector is the verbatim pool clause including its outer brackets
+   (e.g. "{coding:5s}" or "[chrome]"), or NULL when omitted (the
+   runtime will fall back to $AI_AGENT). prompt is the user-typed
+   prompt body, captured verbatim and expanded at execute time. v0
+   does not yet split the /done sentinel or `else' action — those
+   land here in later steps. See docs/pool-dispatch-operator.md. */
 typedef struct agent_dispatch_com {
   int flags;
   int line;
+  WORD_DESC *selector;
   WORD_DESC *prompt;
 } AGENT_DISPATCH_COM;
 #endif

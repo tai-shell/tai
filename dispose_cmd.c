@@ -183,6 +183,8 @@ dispose_command (COMMAND *command)
 	register AGENT_DISPATCH_COM *c;
 
 	c = command->value.AgentDispatch;
+	if (c->selector)
+	  dispose_word (c->selector);
 	if (c->prompt)
 	  dispose_word (c->prompt);
 	free (c);

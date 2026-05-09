@@ -296,6 +296,7 @@ copy_agent_dispatch_command (AGENT_DISPATCH_COM *com)
   new_com = (AGENT_DISPATCH_COM *)xmalloc (sizeof (AGENT_DISPATCH_COM));
   new_com->flags = com->flags;
   new_com->line = com->line;
+  new_com->selector = com->selector ? copy_word (com->selector) : (WORD_DESC *)NULL;
   new_com->prompt = com->prompt ? copy_word (com->prompt) : (WORD_DESC *)NULL;
 
   return (new_com);

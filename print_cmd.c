@@ -887,6 +887,8 @@ void
 print_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
 {
   cprintf ("@");
+  if (agent_command->selector && agent_command->selector->word)
+    cprintf (" %s", agent_command->selector->word);
   if (agent_command->prompt && agent_command->prompt->word)
     cprintf (" %s", agent_command->prompt->word);
 }

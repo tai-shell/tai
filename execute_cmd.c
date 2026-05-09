@@ -3898,10 +3898,10 @@ execute_if_command (IF_COM *if_command)
 }
 
 #if defined (AGENT_DISPATCH)
-/* tai v0 stub. Expands the captured prompt through the normal bash
-   word-expansion machinery (parameter expansion, command
-   substitution, arithmetic, tilde — but NOT word splitting or
-   pathname expansion, since the prompt is one logical string), then
+/* tai v0 stub. Expands selector (if any) and prompt through the
+   normal bash word-expansion machinery (parameter expansion,
+   command substitution, arithmetic, tilde — but NOT word splitting
+   or pathname expansion, since each is one logical string), then
    prints the result to stderr and returns success. Replaced in a
    later commit by the real PTY-injection dispatch (selector
    resolution via holo, prompt rewriting with /done sentinel,
@@ -3909,17 +3909,22 @@ execute_if_command (IF_COM *if_command)
 static int
 execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
 {
-  char *expanded;
+  char *sel_expanded, *prompt_expanded;
 
-  if (agent_command->prompt == 0 || agent_command->prompt->word == 0)
-    {
-      fprintf (stderr, "[tai-agent: (empty)]\n");
-      return (EXECUTION_SUCCESS);
-    }
+  sel_expanded = (agent_command->selector && agent_command->selector->word)
+    ? expand_string_unsplit_to_string (agent_command->selector->word, 0)
+    : (char *)NULL;
 
-  expanded = expand_string_unsplit_to_string (agent_command->prompt->word, 0);
-  fprintf (stderr, "[tai-agent: %s]\n", expanded ? expanded : "");
-  FREE (expanded);
+  prompt_expanded = (agent_command->prompt && agent_command->prompt->word)
+    ? expand_string_unsplit_to_string (agent_command->prompt->word, 0)
+    : (char *)NULL;
+
+  fprintf (stderr, "[tai-agent: sel=%s prompt=%s]\n",
+	   sel_expanded ? sel_expanded : "(default)",
+	   prompt_expanded ? prompt_expanded : "");
+
+  FREE (sel_expanded);
+  FREE (prompt_expanded);
 
   return (EXECUTION_SUCCESS);
 }
