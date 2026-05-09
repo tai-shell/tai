@@ -75,6 +75,9 @@ extern int errno;
 #include "jobs.h"
 #include "execute_cmd.h"
 #include "findcmd.h"
+#if defined (AGENT_DISPATCH)
+#  include "agent_dispatch.h"
+#endif
 #include "redir.h"
 #include "trap.h"
 #include "pathexp.h"
@@ -3898,59 +3901,97 @@ execute_if_command (IF_COM *if_command)
 }
 
 #if defined (AGENT_DISPATCH)
-/* tai v0 stub. Expands selector (if any) and prompt through the
-   normal bash word-expansion machinery (parameter expansion,
-   command substitution, arithmetic, tilde — but NOT word splitting
-   or pathname expansion, since each is one logical string), then
-   prints the result to stderr and returns success. Replaced in a
-   later commit by the real PTY-injection dispatch (selector
-   resolution via holo, prompt rewriting with /done sentinel,
-   asciicast slice for completion-watch). */
+/* Dispatch one prompt through holo. selector / prompt / sentinel
+   are bash-expanded if non-NULL; ownership of the response strings
+   is taken on the result struct.  Returns EXECUTION_SUCCESS or
+   EXECUTION_FAILURE; transport failures and ok==false both map to
+   FAILURE so the caller can run the else_action.
+   broadcast follows the selector ([] vs {}). */
+static int
+agent_dispatch_one (const char *selector_raw,
+		    int broadcast,
+		    const char *prompt_raw,
+		    const char *sentinel,
+		    const char *block_id,
+		    int timeout_ms,
+		    int capture)
+{
+  char *sel_expanded = selector_raw
+    ? expand_string_unsplit_to_string ((char *)selector_raw, 0)
+    : (char *)NULL;
+  char *prompt_expanded = prompt_raw
+    ? expand_string_unsplit_to_string ((char *)prompt_raw, 0)
+    : (char *)NULL;
+
+  agent_dispatch_result result;
+  memset (&result, 0, sizeof result);
+  int rc = agent_dispatch_call (sel_expanded, broadcast, prompt_expanded,
+				sentinel, block_id, timeout_ms,
+				capture, &result);
+
+  if (rc < 0)
+    fprintf (stderr, "tai: dispatch failed: %s (set $TAI_DISPATCH_URL or start holo)\n",
+	     result.error ? result.error : "transport");
+  else if (!result.ok)
+    fprintf (stderr, "tai: dispatch failed: %s%s%s\n",
+	     result.error ? result.error : "unknown",
+	     result.agent_instance ? " (agent " : "",
+	     result.agent_instance ? result.agent_instance : "");
+  else if (result.output)
+    /* capture=true path; print the captured output for the v1
+       single-call case. The real shell-side capture (result=$(@ ...))
+       is a later step. */
+    fputs (result.output, stdout);
+
+  int success = (rc == 0 && result.ok) ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+
+  agent_dispatch_free_result (&result);
+  FREE (sel_expanded);
+  FREE (prompt_expanded);
+  return success;
+}
+
 static int
 execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
 {
-  char *sel_expanded;
+  const char *sel_raw = (agent_command->selector && agent_command->selector->word)
+    ? agent_command->selector->word : (const char *)NULL;
+  int broadcast = sel_raw && sel_raw[0] == '[';
 
-  sel_expanded = (agent_command->selector && agent_command->selector->word)
-    ? expand_string_unsplit_to_string (agent_command->selector->word, 0)
-    : (char *)NULL;
+  int exec_result = EXECUTION_SUCCESS;
 
   if (agent_command->block)
     {
+      char *block_id = agent_dispatch_new_block_id ();
       AGENT_BLOCK_LINE *bl;
-      fprintf (stderr, "[tai-agent: sel=%s do (pinned)]\n",
-	       sel_expanded ? sel_expanded : "(default)");
       for (bl = agent_command->block; bl; bl = bl->next)
 	{
-	  char *line_expanded = (bl->prompt && bl->prompt->word)
-	    ? expand_string_unsplit_to_string (bl->prompt->word, 0)
-	    : (char *)NULL;
-	  fprintf (stderr, "[tai-agent:   prompt=%s sentinel=%s]\n",
-		   line_expanded ? line_expanded : "",
-		   (bl->sentinel && bl->sentinel->word)
-		     ? bl->sentinel->word : "(none)");
-	  FREE (line_expanded);
+	  const char *line_raw = (bl->prompt && bl->prompt->word)
+	    ? bl->prompt->word : "";
+	  const char *line_sentinel = (bl->sentinel && bl->sentinel->word)
+	    ? bl->sentinel->word : (const char *)NULL;
+	  exec_result = agent_dispatch_one (sel_raw, broadcast, line_raw,
+					    line_sentinel, block_id, -1, 0);
+	  if (exec_result != EXECUTION_SUCCESS)
+	    break;
 	}
-      fprintf (stderr, "[tai-agent: end else=%s]\n",
-	       agent_command->else_action ? "(set)" : "(none)");
+      agent_dispatch_release (block_id);
+      free (block_id);
     }
   else
     {
-      char *prompt_expanded =
-	(agent_command->prompt && agent_command->prompt->word)
-	  ? expand_string_unsplit_to_string (agent_command->prompt->word, 0)
-	  : (char *)NULL;
-      fprintf (stderr, "[tai-agent: sel=%s prompt=%s sentinel=%s else=%s]\n",
-	       sel_expanded ? sel_expanded : "(default)",
-	       prompt_expanded ? prompt_expanded : "",
-	       (agent_command->sentinel && agent_command->sentinel->word)
-		 ? agent_command->sentinel->word : "(none)",
-	       agent_command->else_action ? "(set)" : "(none)");
-      FREE (prompt_expanded);
+      const char *prompt_raw = (agent_command->prompt && agent_command->prompt->word)
+	? agent_command->prompt->word : (const char *)NULL;
+      const char *sentinel = (agent_command->sentinel && agent_command->sentinel->word)
+	? agent_command->sentinel->word : (const char *)NULL;
+      exec_result = agent_dispatch_one (sel_raw, broadcast, prompt_raw,
+					sentinel, NULL, -1, 0);
     }
 
-  FREE (sel_expanded);
-  return (EXECUTION_SUCCESS);
+  if (exec_result != EXECUTION_SUCCESS && agent_command->else_action)
+    return execute_command (agent_command->else_action);
+
+  return exec_result;
 }
 #endif
 
