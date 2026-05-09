@@ -321,9 +321,11 @@ static int save_simple_lineno = -1;
 
 #if defined (AGENT_DISPATCH)
 /* parse_at_dispatch returns AT_DISPATCH with the prompt as
-   yylval.word; the matching pool selector (if any) is parked here
-   for the agent_dispatch_command grammar action to pick up. */
+   yylval.word; the matching pool selector and trailing /<id>
+   sentinel (if any) are parked here for the agent_dispatch_command
+   grammar action to pick up. */
 static WORD_DESC *agent_pending_selector = (WORD_DESC *)NULL;
+static WORD_DESC *agent_pending_sentinel = (WORD_DESC *)NULL;
 #endif
 
 /* The line number in a script on which a function definition starts. */
@@ -1228,8 +1230,10 @@ cond_command:	COND_START COND_CMD COND_END
 agent_dispatch_command: AT_DISPATCH
 			{
 			  WORD_DESC *sel = agent_pending_selector;
+			  WORD_DESC *sentinel = agent_pending_sentinel;
 			  agent_pending_selector = (WORD_DESC *)NULL;
-			  $$ = make_agent_dispatch_command (sel, $1, line_number);
+			  agent_pending_sentinel = (WORD_DESC *)NULL;
+			  $$ = make_agent_dispatch_command (sel, $1, sentinel, line_number);
 			}
 	;
 
@@ -5113,11 +5117,56 @@ parse_at_dispatch (int c)
   if (ch != EOF)
     shell_ungetc (ch);
 
+  /* Look for a trailing sync sentinel `/<id>'. Walk back over
+     trailing blanks, then over identifier characters; if the char
+     before that is `/' AND there is whitespace (or beginning-of-
+     buffer) before the `/', strip the `/<id>' off the end of the
+     prompt and stash it as the pending sentinel.
+
+     Identifier characters: alnum + `_' + `-'. */
+  {
+    size_t end = prompt_indx;
+    size_t id_end;
+    while (end > 0 &&
+	   (prompt_buf[end - 1] == ' ' || prompt_buf[end - 1] == '\t'))
+      end--;
+    id_end = end;
+    while (id_end > 0 &&
+	   (ISALNUM (prompt_buf[id_end - 1]) ||
+	    prompt_buf[id_end - 1] == '_' ||
+	    prompt_buf[id_end - 1] == '-'))
+      id_end--;
+    if (id_end < end && id_end > 0 && prompt_buf[id_end - 1] == '/' &&
+	(id_end == 1 ||
+	 prompt_buf[id_end - 2] == ' ' ||
+	 prompt_buf[id_end - 2] == '\t'))
+      {
+	/* /<id> found. Capture the identifier, then trim the prompt
+	   to end at the whitespace before the `/' (or to length 0 if
+	   the slash was at the start). */
+	size_t id_len = end - id_end;
+	char *id_buf = (char *)xmalloc (id_len + 1);
+	memcpy (id_buf, prompt_buf + id_end, id_len);
+	id_buf[id_len] = '\0';
+	agent_pending_sentinel = make_word (id_buf);
+	free (id_buf);
+
+	/* Trim back over the `/' and any whitespace before it. */
+	prompt_indx = id_end - 1;
+	while (prompt_indx > 0 &&
+	       (prompt_buf[prompt_indx - 1] == ' ' ||
+		prompt_buf[prompt_indx - 1] == '\t'))
+	  prompt_indx--;
+	prompt_buf[prompt_indx] = '\0';
+      }
+  }
+
   if (getenv ("TAI_DEBUG"))
-    fprintf (stderr, "tai: agent-dispatch at line %d: sel=%s prompt=%s\n",
+    fprintf (stderr, "tai: agent-dispatch at line %d: sel=%s prompt=%s sentinel=%s\n",
 	     line_number,
 	     sel_buf ? sel_buf : "(none)",
-	     prompt_buf);
+	     prompt_buf,
+	     agent_pending_sentinel ? agent_pending_sentinel->word : "(none)");
 
   sel_wd = sel_buf ? make_word (sel_buf) : (WORD_DESC *)NULL;
   prompt_wd = make_word (prompt_buf);
@@ -5126,8 +5175,8 @@ parse_at_dispatch (int c)
 
   /* Stash both pieces. The grammar action assembles them into the
      real AGENT_DISPATCH_COM via make_agent_dispatch_command(). We
-     piggy-back the selector through a static slot the action picks
-     up after AT_DISPATCH reduces. */
+     piggy-back the selector and sentinel through static slots the
+     action picks up after AT_DISPATCH reduces. */
   agent_pending_selector = sel_wd;
   yylval.word = prompt_wd;
   return AT_DISPATCH;

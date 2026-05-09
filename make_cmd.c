@@ -411,7 +411,8 @@ make_arith_command (WORD_LIST *exp)
 
 #if defined (AGENT_DISPATCH)
 COMMAND *
-make_agent_dispatch_command (WORD_DESC *selector, WORD_DESC *prompt, int lineno)
+make_agent_dispatch_command (WORD_DESC *selector, WORD_DESC *prompt,
+			     WORD_DESC *sentinel, int lineno)
 {
   COMMAND *command;
   AGENT_DISPATCH_COM *temp;
@@ -423,6 +424,7 @@ make_agent_dispatch_command (WORD_DESC *selector, WORD_DESC *prompt, int lineno)
   temp->line = lineno;
   temp->selector = selector;
   temp->prompt = prompt;
+  temp->sentinel = sentinel;
 
   command->type = cm_agent_dispatch;
   command->redirects = (REDIRECT *)NULL;

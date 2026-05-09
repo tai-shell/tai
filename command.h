@@ -345,14 +345,18 @@ typedef struct cond_com {
    selector is the verbatim pool clause including its outer brackets
    (e.g. "{coding:5s}" or "[chrome]"), or NULL when omitted (the
    runtime will fall back to $AI_AGENT). prompt is the user-typed
-   prompt body, captured verbatim and expanded at execute time. v0
-   does not yet split the /done sentinel or `else' action — those
-   land here in later steps. See docs/pool-dispatch-operator.md. */
+   prompt body, captured verbatim and expanded at execute time.
+   sentinel is the trailing `/<id>' completion-marker token, stored
+   without the leading slash (e.g. "done", "finished"), or NULL when
+   omitted. The runtime appends `:<nonce>' at injection time and
+   watches the agent's PTY for that exact line.  See
+   docs/pool-dispatch-operator.md. */
 typedef struct agent_dispatch_com {
   int flags;
   int line;
   WORD_DESC *selector;
   WORD_DESC *prompt;
+  WORD_DESC *sentinel;
 } AGENT_DISPATCH_COM;
 #endif
 

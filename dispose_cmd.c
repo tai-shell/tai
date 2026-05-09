@@ -187,6 +187,8 @@ dispose_command (COMMAND *command)
 	  dispose_word (c->selector);
 	if (c->prompt)
 	  dispose_word (c->prompt);
+	if (c->sentinel)
+	  dispose_word (c->sentinel);
 	free (c);
 	break;
       }

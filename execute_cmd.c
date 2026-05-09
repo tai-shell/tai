@@ -3919,9 +3919,11 @@ execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
     ? expand_string_unsplit_to_string (agent_command->prompt->word, 0)
     : (char *)NULL;
 
-  fprintf (stderr, "[tai-agent: sel=%s prompt=%s]\n",
+  fprintf (stderr, "[tai-agent: sel=%s prompt=%s sentinel=%s]\n",
 	   sel_expanded ? sel_expanded : "(default)",
-	   prompt_expanded ? prompt_expanded : "");
+	   prompt_expanded ? prompt_expanded : "",
+	   (agent_command->sentinel && agent_command->sentinel->word)
+	     ? agent_command->sentinel->word : "(none)");
 
   FREE (sel_expanded);
   FREE (prompt_expanded);
