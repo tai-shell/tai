@@ -320,14 +320,18 @@ static int simplecmd_lineno = -1;
 static int save_simple_lineno = -1;
 
 #if defined (AGENT_DISPATCH)
-/* AT_DISPATCH carries this struct as its yylval, so all three pieces
+/* AT_DISPATCH carries this struct as its yylval, so all four pieces
    captured by parse_at_dispatch survive any recursive parse_at_dispatch
    call inside an `else' action. The grammar action frees the struct
-   and assembles the AGENT_DISPATCH_COM. */
+   and assembles the AGENT_DISPATCH_COM.
+
+   When `block' is non-NULL the dispatch is the do…end block form
+   (prompt/sentinel are NULL); otherwise it is the single-line form. */
 struct agent_dispatch_tok {
   WORD_DESC *selector;
   WORD_DESC *prompt;
   WORD_DESC *sentinel;
+  AGENT_BLOCK_LINE *block;
 };
 #endif
 
@@ -1238,6 +1242,7 @@ agent_dispatch_command: AT_DISPATCH
 			  $$ = make_agent_dispatch_command ($1->selector,
 							    $1->prompt,
 							    $1->sentinel,
+							    $1->block,
 							    (COMMAND *)NULL,
 							    line_number);
 			  free ($1);
@@ -1247,6 +1252,7 @@ agent_dispatch_command: AT_DISPATCH
 			  $$ = make_agent_dispatch_command ($1->selector,
 							    $1->prompt,
 							    $1->sentinel,
+							    $1->block,
 							    $3, line_number);
 			  free ($1);
 			}
@@ -5220,26 +5226,178 @@ parse_at_dispatch (int c)
       }
   }
 
+  /* Detect the `do' keyword as a block opener. If the captured
+     prompt is exactly "do" (after trimming whitespace) AND there
+     is no sentinel attached, switch to block-line capture mode:
+     read lines until a line whose first non-blank word is `end'.
+     Each block line is a prompt + optional /<sentinel>. */
+  AGENT_BLOCK_LINE *block_head = (AGENT_BLOCK_LINE *)NULL;
+  AGENT_BLOCK_LINE *block_tail = (AGENT_BLOCK_LINE *)NULL;
+  if (sentinel_wd == NULL)
+    {
+      size_t s, e;
+      for (s = 0; s < prompt_indx &&
+	   (prompt_buf[s] == ' ' || prompt_buf[s] == '\t'); s++)
+	;
+      e = prompt_indx;
+      while (e > s &&
+	     (prompt_buf[e - 1] == ' ' || prompt_buf[e - 1] == '\t'))
+	e--;
+      if (e - s == 2 && prompt_buf[s] == 'd' && prompt_buf[s + 1] == 'o')
+	{
+	  /* Block mode. Drop the captured "do" prompt — block carries
+	     the per-line prompts instead. */
+	  prompt_indx = 0;
+	  prompt_buf[0] = '\0';
+
+	  for (;;)
+	    {
+	      char *line_buf;
+	      size_t line_indx, line_alloc;
+	      int line_ch;
+
+	      /* Skip blank lines and leading whitespace. */
+	      do
+		line_ch = shell_getc (1);
+	      while (line_ch == ' ' || line_ch == '\t' || line_ch == '\n');
+
+	      if (line_ch == EOF)
+		break;	/* unterminated block — accept as-is for v0 */
+
+	      line_alloc = 64;
+	      line_indx = 0;
+	      line_buf = (char *)xmalloc (line_alloc);
+	      while (line_ch != EOF && line_ch != '\n')
+		{
+		  agent_buf_append (&line_buf, &line_indx, &line_alloc, line_ch);
+		  line_ch = shell_getc (1);
+		}
+	      line_buf[line_indx] = '\0';
+
+	      /* Trim trailing whitespace. */
+	      while (line_indx > 0 &&
+		     (line_buf[line_indx - 1] == ' ' ||
+		      line_buf[line_indx - 1] == '\t'))
+		line_indx--;
+	      line_buf[line_indx] = '\0';
+
+	      /* A line whose first word is `end' closes the block.
+	         Anything after `end' (e.g. ` else <action>') is pushed
+	         back so the tail-capture loop below picks it up. */
+	      if (line_indx >= 3 &&
+		  line_buf[0] == 'e' && line_buf[1] == 'n' && line_buf[2] == 'd' &&
+		  (line_indx == 3 ||
+		   line_buf[3] == ' ' || line_buf[3] == '\t'))
+		{
+		  if (line_indx > 3)
+		    shell_ungets (line_buf + 3);
+		  free (line_buf);
+		  break;
+		}
+
+	      /* Detect trailing /<id> sentinel on this block line. */
+	      WORD_DESC *line_sentinel = (WORD_DESC *)NULL;
+	      {
+		size_t end_l = line_indx;
+		size_t id_end_l = end_l;
+		while (id_end_l > 0 &&
+		       (ISALNUM (line_buf[id_end_l - 1]) ||
+			line_buf[id_end_l - 1] == '_' ||
+			line_buf[id_end_l - 1] == '-'))
+		  id_end_l--;
+		if (id_end_l < end_l && id_end_l > 0 &&
+		    line_buf[id_end_l - 1] == '/' &&
+		    (id_end_l == 1 ||
+		     line_buf[id_end_l - 2] == ' ' ||
+		     line_buf[id_end_l - 2] == '\t'))
+		  {
+		    size_t id_len = end_l - id_end_l;
+		    char *id_buf = (char *)xmalloc (id_len + 1);
+		    memcpy (id_buf, line_buf + id_end_l, id_len);
+		    id_buf[id_len] = '\0';
+		    line_sentinel = make_word (id_buf);
+		    free (id_buf);
+		    line_indx = id_end_l - 1;
+		    while (line_indx > 0 &&
+			   (line_buf[line_indx - 1] == ' ' ||
+			    line_buf[line_indx - 1] == '\t'))
+		      line_indx--;
+		    line_buf[line_indx] = '\0';
+		  }
+	      }
+
+	      AGENT_BLOCK_LINE *bl =
+		(AGENT_BLOCK_LINE *)xmalloc (sizeof (AGENT_BLOCK_LINE));
+	      bl->prompt = make_word (line_buf);
+	      bl->sentinel = line_sentinel;
+	      bl->next = (AGENT_BLOCK_LINE *)NULL;
+	      if (block_tail) block_tail->next = bl;
+	      else block_head = bl;
+	      block_tail = bl;
+	      free (line_buf);
+	    }
+
+	  /* After `end', look for an optional ` else <action>' tail
+	     on the same line. Read until \n/;/EOF, then run the same
+	     else-detection used for single-line form. */
+	  {
+	    char *tail_buf = (char *)xmalloc (64);
+	    size_t tail_indx = 0, tail_alloc = 64;
+	    int tail_ch = shell_getc (1);
+	    while (tail_ch != EOF && tail_ch != '\n' && tail_ch != ';')
+	      {
+		agent_buf_append (&tail_buf, &tail_indx, &tail_alloc, tail_ch);
+		tail_ch = shell_getc (1);
+	      }
+	    tail_buf[tail_indx] = '\0';
+	    if (tail_ch != EOF) shell_ungetc (tail_ch);
+	    {
+	      size_t i;
+	      for (i = 0; i + 4 < tail_indx; i++)
+		{
+		  if ((i == 0 || tail_buf[i - 1] == ' ' || tail_buf[i - 1] == '\t') &&
+		      tail_buf[i] == 'e' && tail_buf[i + 1] == 'l' &&
+		      tail_buf[i + 2] == 's' && tail_buf[i + 3] == 'e' &&
+		      (tail_buf[i + 4] == ' ' || tail_buf[i + 4] == '\t'))
+		    {
+		      size_t action_at = i + 4;
+		      while (action_at < tail_indx &&
+			     (tail_buf[action_at] == ' ' ||
+			      tail_buf[action_at] == '\t'))
+			action_at++;
+		      if (action_at < tail_indx)
+			shell_ungets (tail_buf + action_at);
+		      token_to_read = ELSE;
+		      break;
+		    }
+		}
+	    }
+	    free (tail_buf);
+	  }
+	}
+    }
+
   if (getenv ("TAI_DEBUG"))
-    fprintf (stderr, "tai: agent-dispatch at line %d: sel=%s prompt=%s sentinel=%s\n",
+    fprintf (stderr, "tai: agent-dispatch at line %d: sel=%s prompt=%s sentinel=%s block=%s\n",
 	     line_number,
 	     sel_buf ? sel_buf : "(none)",
 	     prompt_buf,
-	     sentinel_wd ? sentinel_wd->word : "(none)");
+	     sentinel_wd ? sentinel_wd->word : "(none)",
+	     block_head ? "(set)" : "(none)");
 
   sel_wd = sel_buf ? make_word (sel_buf) : (WORD_DESC *)NULL;
-  prompt_wd = make_word (prompt_buf);
+  prompt_wd = (block_head == NULL) ? make_word (prompt_buf) : (WORD_DESC *)NULL;
   free (sel_buf);
   free (prompt_buf);
 
-  /* Pack all three captured pieces into a struct attached to the
-     AT_DISPATCH yylval. The grammar action unpacks and frees it.
-     This is recursion-safe — a nested parse_at_dispatch (e.g. in an
-     `else' action) gets its own struct. */
+  /* Pack everything into the AT_DISPATCH token. The grammar action
+     unpacks and frees the struct. Recursion-safe — a nested
+     parse_at_dispatch (in an `else' action) gets its own struct. */
   tok = (struct agent_dispatch_tok *)xmalloc (sizeof (struct agent_dispatch_tok));
   tok->selector = sel_wd;
   tok->prompt = prompt_wd;
   tok->sentinel = sentinel_wd;
+  tok->block = block_head;
   yylval.agent_dispatch_tok = tok;
   return AT_DISPATCH;
 }

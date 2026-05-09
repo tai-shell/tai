@@ -889,10 +889,27 @@ print_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
   cprintf ("@");
   if (agent_command->selector && agent_command->selector->word)
     cprintf (" %s", agent_command->selector->word);
-  if (agent_command->prompt && agent_command->prompt->word)
-    cprintf (" %s", agent_command->prompt->word);
-  if (agent_command->sentinel && agent_command->sentinel->word)
-    cprintf (" /%s", agent_command->sentinel->word);
+  if (agent_command->block)
+    {
+      AGENT_BLOCK_LINE *bl;
+      cprintf (" do");
+      for (bl = agent_command->block; bl; bl = bl->next)
+	{
+	  cprintf ("\n  ");
+	  if (bl->prompt && bl->prompt->word)
+	    cprintf ("%s", bl->prompt->word);
+	  if (bl->sentinel && bl->sentinel->word)
+	    cprintf (" /%s", bl->sentinel->word);
+	}
+      cprintf ("\nend");
+    }
+  else
+    {
+      if (agent_command->prompt && agent_command->prompt->word)
+	cprintf (" %s", agent_command->prompt->word);
+      if (agent_command->sentinel && agent_command->sentinel->word)
+	cprintf (" /%s", agent_command->sentinel->word);
+    }
   if (agent_command->else_action)
     {
       cprintf (" else ");

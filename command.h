@@ -341,22 +341,28 @@ typedef struct cond_com {
 } COND_COM;
 
 #if defined (AGENT_DISPATCH)
-/* The "agent dispatch" command — `@ {selector} prompt /done'.
-   selector is the verbatim pool clause including its outer brackets
-   (e.g. "{coding:5s}" or "[chrome]"), or NULL when omitted (the
-   runtime will fall back to $AI_AGENT). prompt is the user-typed
-   prompt body, captured verbatim and expanded at execute time.
-   sentinel is the trailing `/<id>' completion-marker token, stored
-   without the leading slash (e.g. "done", "finished"), or NULL when
-   omitted. The runtime appends `:<nonce>' at injection time and
-   watches the agent's PTY for that exact line.  See
-   docs/pool-dispatch-operator.md. */
+/* One line of a `@ {sel} do ... end' block. The block iterates each
+   line through the same pinned agent. */
+typedef struct agent_block_line {
+  WORD_DESC *prompt;
+  WORD_DESC *sentinel;		/* /<id> on this line, or NULL */
+  struct agent_block_line *next;
+} AGENT_BLOCK_LINE;
+
+/* The "agent dispatch" command — `@ {selector} prompt /done'
+   single-line form, OR `@ {selector} do <lines> end' block form
+   for stickiness across a series of prompts on the same agent.
+   selector / prompt / sentinel describe the single-line form;
+   `block' is non-NULL only for the block form (and prompt/sentinel
+   are NULL there). else_action is the optional `else <cmd>' tail.
+   See docs/pool-dispatch-operator.md. */
 typedef struct agent_dispatch_com {
   int flags;
   int line;
   WORD_DESC *selector;
   WORD_DESC *prompt;
   WORD_DESC *sentinel;
+  AGENT_BLOCK_LINE *block;	/* do…end body, or NULL. */
   struct command *else_action;	/* `else <cmd>' fallback, or NULL. */
 } AGENT_DISPATCH_COM;
 #endif
