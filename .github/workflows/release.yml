@@ -22,20 +22,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 is Apple Silicon; produces an arm64-only binary.
+          # One macOS build: universal2 (arm64 + x86_64 fat binary)
+          # on the Apple Silicon runner. We drove this in via plain
+          # `-arch' flags in CFLAGS+LDFLAGS — bash's autoconf does
+          # mostly preprocessor / link tests (arch-invariant on
+          # macOS) and the few AC_TRY_RUN probes execute the fat
+          # binary's arm64 slice on the build host. Apple has
+          # shipped bash as fat-binary in macOS for years, so the
+          # codebase is well-validated for this approach.
+          #
+          # Avoids the macos-13 (Intel) GHA runner queue starvation
+          # that was blocking releases.
           - runner: macos-14
-            target: macos-arm64
-            artifact: tai-macos-arm64
-          # macos-13 is the last GitHub-hosted Intel Mac runner.
-          # Slower queue than macos-14 but reliable for C builds —
-          # bash's configure does not cross-compile cleanly without
-          # a pre-baked cross-build cache, so we use a real Intel
-          # runner instead of cross-arch flags. Universal2 (one fat
-          # binary) is a follow-up if/when bash 5.3's configure +
-          # generated-program build steps grow multi-arch support.
-          - runner: macos-13
-            target: macos-x86_64
-            artifact: tai-macos-x86_64
+            target: macos-universal2
+            artifact: tai-macos-universal2
           - runner: ubuntu-latest
             target: linux-x86_64
             artifact: tai-linux-x86_64
@@ -61,10 +61,18 @@ jobs:
 
       - name: Configure & build
         run: |
-          ./configure --quiet
           if [ "$RUNNER_OS" = "macOS" ]; then
+            # Universal2: pass -arch flags through CFLAGS+LDFLAGS.
+            # Apple's clang builds fat .o files; the linker produces
+            # a fat binary directly. min-version 11.0 is the highest
+            # arm64 deployment target supported and works for x86_64
+            # too (Big Sur+).
+            export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2"
+            export LDFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
+            ./configure --quiet
             make -j$(sysctl -n hw.ncpu)
           else
+            ./configure --quiet
             make -j$(nproc)
           fi
           ls -la bash
@@ -75,6 +83,15 @@ jobs:
           cp bash "out/${{ matrix.artifact }}"
           chmod +x "out/${{ matrix.artifact }}"
           file "out/${{ matrix.artifact }}"
+          # Universal2 sanity check: lipo should report both arches.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            archs=$(lipo -archs "out/${{ matrix.artifact }}")
+            echo "lipo archs: ${archs}"
+            case "${archs}" in
+              *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
+              *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
+            esac
+          fi
           "./out/${{ matrix.artifact }}" --version
           # Smoke test: arithmetic + a simple `for' loop.
           "./out/${{ matrix.artifact }}" -c 'echo 1+1=$((1+1)); for i in 1 2 3; do echo iter $i; done'
