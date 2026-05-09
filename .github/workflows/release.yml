@@ -93,6 +93,14 @@ jobs:
       # c2w-net container (Alpine 3.19) and the WASM VM that ships
       # with it. Image cache lets the apk add complete in seconds
       # on subsequent runs.
+      #
+      # `touch configure aclocal.m4 configure.ac' nudges the
+      # mtime ordering so autotools-generated Makefile rules don't
+      # try to regenerate `configure' from `configure.ac' (which
+      # would require autoconf — bash 5.3 ships a working
+      # configure, no regeneration needed). Without this, fresh
+      # checkout timestamps occasionally land in the wrong order
+      # and `make' fails with `autoconf: not found'.
       - name: Configure & build (alpine/musl)
         if: matrix.builder == 'alpine'
         run: |
@@ -102,6 +110,7 @@ jobs:
             alpine:3.19 sh -c '
               set -e
               apk add --no-cache build-base bison
+              touch aclocal.m4 configure.ac configure
               ./configure --quiet
               make -j$(nproc)
               ls -la bash
