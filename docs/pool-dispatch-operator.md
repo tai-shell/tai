@@ -1,163 +1,393 @@
-# Pool Dispatch Operator — Grammar and Semantics
+# Agent Dispatch Operator — Grammar and Semantics
 
-A grouping-symbol operator for dispatching inputs to a bounded pool of
-worker resources, with predicate-based selection and timeout-bounded
-waiting.
+A bash-extension operator for dispatching prompts to one or more AI
+agent CLI instances running in their own xterms (Droids), with
+predicate-based selection, timeout-bounded waiting, and self-announced
+completion.
 
-## Overview
+## Heritage
 
-The operator uses brace syntax `{ ... }` to denote a *pool* of workers
-matching a selector. A statement of the form:
+This is `expect/send` generalized. Where `expect` controls one process
+via a single PTY, this addresses N PTYs by capability or label, with
+mDNS-based discovery (via holo) and a bash-flavored host language. The
+shell does **not** own each agent's lifecycle — agents are long-lived
+REPLs in their own terminals. The operator injects keystrokes and
+watches for a self-announced completion sentinel; it never spawns,
+waits-on, or reaps the agent process.
+
+## Two operators, one model
+
+- `@` — *address an agent.* Followed by an optional pool selector and
+  a prompt. The prompt is dispatched to the matching agent's terminal
+  via PTY injection.
+- `{...}` and `[...]` — *pool selectors.* `{}` picks one matching
+  agent; `[]` broadcasts to every matching agent. `@` is the verb;
+  `{}` / `[]` is the addressee.
+
+### Why braces and brackets
+
+- `{...}` denotes a *set* — pick one. Order doesn't matter.
+- `[...]` denotes an *ordered collection* — broadcast preserves
+  iteration order if needed.
+- The cardinality of the dispatch (one vs. many) is visible at a
+  glance from the bracket shape.
+
+### Why `@`
+
+- Reads as "addressing" — matches the GitHub/Slack/Twitter convention.
+- No collision with bash semantics: `$@`, `${var[@]}`, `${var@Q}` all
+  require a `$` or `[` first; `@(pattern)` extglob only appears at
+  argument position.
+- Absolute-path commands (`/usr/bin/foo`) keep working — `@` does not
+  shadow the `/`-prefix everyday users rely on.
+
+## Surface grammar
 
 ```
-{<selector>:<wait-config>} <input> [else <action>]
+dispatch       ::= "@" [ pool ] [ prompt ] [ sentinel ] [ "else" action ]
+                 | "@" [ pool ] "do" line { line } "end"
+
+pool           ::= "{" selector [ ":" wait_config ] "}"      (* pick one *)
+                 | "[" selector [ ":" wait_config ] "]"      (* broadcast *)
+                 | (omitted)                                  (* uses $AI_AGENT *)
+
+selector       ::= "*"
+                 | predicate_or
+predicate_or   ::= predicate_and { "or" predicate_and }
+predicate_and  ::= predicate { "," predicate }
+predicate      ::= [ "!" ] atom
+atom           ::= tag | attr_compare | "(" predicate_or ")"
+
+tag            ::= identifier
+attr_compare   ::= identifier op value
+op             ::= "=" | "!=" | "<" | "<=" | ">" | ">="
+value          ::= number | string | version | duration | size
+
+wait_config    ::= wait_term { ";" wait_term }              (* ; not , — see below *)
+wait_term      ::= duration | scheduling_hint
+duration       ::= "0" | "inf" | <number><unit>
+unit           ::= "ms" | "s" | "m" | "h"
+
+prompt         ::= bash_word_list                           (* normal expansion *)
+                 | here_doc
+
+sentinel       ::= "/" identifier                           (* default: /done *)
+
+action         ::= bash_command_list                        (* incl. nested @ *)
+line           ::= prompt [ sentinel ]                      (* inside do…end *)
 ```
 
-picks one worker from the pool that satisfies the selector and dispatches
-`<input>` to it, waiting up to the configured time if no worker is
-currently free.
+`;` is the separator inside `wait_config` rather than `,` so the
+selector's AND-comma stays unambiguous: `{coding:5s;fifo}` is *coding,
+five-second wait, FIFO*; `{coding,gpu:5s}` is *coding AND gpu, five-
+second wait*. The colon partitions selector from wait config.
 
-### Why braces
+## Selector semantics
 
-- `{}` denotes a *set* in mathematics — unordered, no positional meaning.
-  This matches a worker pool: you don't care *which* of several
-  interchangeable workers takes the job, only that one is free.
-- `[]` implies an ordered/indexed sequence, which would be misleading.
-- `()` implies an ordered tuple or function application.
+| Form                              | Meaning                                  |
+| --------------------------------- | ---------------------------------------- |
+| `{*}`                             | any agent (pick one)                     |
+| `[*]`                             | every agent (broadcast)                  |
+| `{coding}`                        | tagged `coding`                          |
+| `{!coding}`                       | not tagged `coding`                      |
+| `{coding, gpu}`                   | tagged both (AND)                        |
+| `{coding or research}`            | tagged either (OR)                       |
+| `{model=claude-sonnet-4}`         | attribute equality                       |
+| `{context>=200k}`                 | attribute comparison                     |
+| `{(gpt or claude), region=us}`    | grouped OR with AND                      |
+| `[chrome]`                        | every chrome instance                    |
 
-This leaves `[*]` free for a sibling fan-out operator (broadcast to all
-workers), should it be needed later.
+Predicates are evaluated at dispatch time (snapshot semantics). An
+agent that satisfies `queue_depth<5` at pick time may exceed it during
+generation; selection predicates are not runtime invariants.
 
-## Grammar (EBNF-ish)
+## Wait configuration
+
+| Form              | Meaning                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `{sel}`           | wait up to the registry's configured pool default        |
+| `{sel:0}`         | don't wait — dispatch only if a free agent exists *now*  |
+| `{sel:5s}`        | wait up to 5 seconds                                     |
+| `{sel:5s;fifo}`   | wait up to 5s, FIFO scheduling among waiters             |
+| `{sel:inf}`       | wait forever (explicit; no implicit forever-wait)        |
+
+`{sel}` (no wait config) does **not** default to forever. The registry
+declares a per-pool timeout; `{sel}` inherits it. Implicit forever-
+waits are a reliability foot-gun in networked / interactive contexts;
+`:inf` exists for the rare case where it's actually wanted.
+
+## Failure modes
+
+- **Static-attribute miss.** No agent can ever satisfy the selector
+  (e.g. `model=claude-sonnet-99`). Fail immediately; ignore timeout.
+  Waiting cannot conjure an agent that does not exist.
+- **Dynamic-attribute miss.** Agents could match but currently don't
+  (e.g. all matches are over rate-limit). Wait up to timeout — the
+  metric may change.
+- **Pool saturation.** Matching agents exist but all are busy
+  (mid-generation, REPL not yet at ready state). Wait up to timeout.
+- **Sentinel timeout.** The agent accepted the prompt but did not
+  emit the sync sentinel within the wait_config window. Treated as a
+  timeout; `else` action fires.
+- **Dynamic-attribute unknown.** A required dynamic attribute has no
+  current value (collector hasn't reported yet, agent just joined).
+  Treated as not-yet-satisfied (wait), to avoid optimistic dispatches
+  that may never complete.
+
+Whether an attribute is static or dynamic is determined by the agent's
+declaration in the registry, not by selector syntax. (See "Open /
+deferred" — making the static/dynamic split visible at the call site
+is on the table.)
+
+## Sync sentinel — `/done` and friends
+
+A trailing `/identifier` after the prompt is a *sync sentinel*: it
+tells the runtime to consider the dispatch complete when the agent
+emits a matching marker line in its terminal.
 
 ```
-dispatch        ::= pool_expr input [ "else" action ]
-
-pool_expr       ::= "{" selector [ ":" wait_config ] "}"
-
-selector        ::= "*"                              (* match any *)
-                  | predicate_or
-
-predicate_or    ::= predicate_and { "or" predicate_and }
-predicate_and   ::= predicate { "," predicate }
-predicate       ::= [ "!" ] atom
-atom            ::= tag
-                  | attr_compare
-                  | "(" predicate_or ")"
-
-tag             ::= identifier                       (* bare tag = membership *)
-attr_compare    ::= identifier op value
-op              ::= "=" | "!=" | "<" | "<=" | ">" | ">="
-value           ::= number | string | version | duration | size
-
-wait_config     ::= wait_term { "," wait_term }
-wait_term       ::= duration                         (* 0, 5s, 2m, ... *)
-                  | scheduling_hint                  (* fifo, lifo, ... *)
-
-duration        ::= "0" | <number><unit>             (* unit: ms, s, m, h *)
-input           ::= <whatever the host language uses>
-action          ::= <statement in host language>
+@ {research:30s} "summarize $url" /done
 ```
 
-## Semantics
+Compiles to roughly:
 
-### Selector evaluation
+1. Pick a free agent matching `{research}`.
+2. Generate a unique nonce (e.g. `7f3a9c1b`).
+3. Inject the user's prompt as keystrokes, with a system-instruction
+   prefix:
 
-| Form                      | Meaning                             |
-| ------------------------- | ----------------------------------- |
-| `{*}`                     | any resource                        |
-| `{audio}`                 | has tag `audio`                     |
-| `{!audio}`                | does not have tag `audio`           |
-| `{audio, video}`          | has both tags (AND)                 |
-| `{audio or video}`        | has either tag (OR)                 |
-| `{java>=11}`              | attribute `java` >= 11              |
-| `{audio, cpu<70}`         | tagged audio AND cpu under 70%      |
-| `{(gpu or tpu), mem>2GB}` | accelerator present AND >2GB memory |
+   ```
+   <user prompt>
+   When this task is fully complete, print exactly:
+       /done:7f3a9c1b
+   on its own line.
+   ```
 
-### Wait configuration
+4. Watch the agent's PTY (via the asciicast-recorder slice) for the
+   line `/done:7f3a9c1b`.
+5. On match → dispatch complete; agent is "free" again.
+6. On wait_config timeout without match → `else` fires.
 
-| Form            | Meaning                                      |
-| --------------- | -------------------------------------------- |
-| `{sel}`         | wait forever for a match                     |
-| `{sel:0}`       | don't wait — dispatch only if free right now |
-| `{sel:5s}`      | wait up to 5 seconds                         |
-| `{sel:5s,fifo}` | wait up to 5s, FIFO scheduling among waiters |
+Without a sentinel, dispatch is fire-and-forget: the runtime hands
+off keystrokes and returns control immediately. There is no way to
+detect completion or block on it.
 
-### Failure modes
+`/done` is the canonical name; users may pick any identifier. Multiple
+sentinels (e.g. `/progress` for streaming events, `/error` for
+explicit failure) are reserved for v2.
 
-- **Static-attribute miss** — no worker can ever satisfy the selector
-  (e.g. `java>=11` when no such worker exists in the pool). Fail
-  immediately; ignore the timeout. Waiting cannot conjure a worker that
-  doesn't exist.
-- **Dynamic-attribute miss** — workers exist that *could* satisfy the
-  selector, but currently don't (e.g. all matching workers have
-  `cpu>=70`). Wait up to the timeout, since dynamic metrics may change.
-- **Pool saturation** — matching workers exist but all are busy. Wait up
-  to the timeout.
+### Why printable + nonce, not a non-printable byte
 
-Whether an attribute is static or dynamic is determined by its
-declaration on the worker, not by selector syntax.
+Plain printable ASCII with a unique per-dispatch nonce eliminates the
+collision risk that motivates non-printable markers in the first
+place. Non-printables have several real downsides:
 
-### Predicate evaluation timing
+- PTYs interpret most C0 control bytes (`\x07` is bell, `\x1b` starts
+  escape sequences, `\x0d` resets the cursor). Most of the C0 range
+  *does something* when it reaches a terminal.
+- LLMs do not reliably emit specific bytes when instructed. They
+  produce the name of the character, an escape sequence, or skip it.
+- Non-printables are invisible in playback, scroll-back, and grep
+  output — debugging "did the marker actually arrive" becomes hard.
 
-Predicates are evaluated at **dispatch time** (snapshot semantics). A
-worker that satisfies `cpu<70` at the moment it is picked may exceed
-that threshold during execution; this is *not* enforced mid-job.
-Selection predicates are not runtime invariants.
+A nonce-bearing printable sentinel is collision-free without
+inheriting any of those problems.
 
-### Timeout action
+## Stickiness — the `do…end` block
 
-- With `else <action>`: on timeout, run the action and continue.
-- Without `else`: on timeout, raise an error and abort. Strict by
-  default. Use explicit `else skip` to drop silently.
+Within a `do…end` block scoped to an `@` dispatch, every `@` (or
+bare prompt line) inside addresses the *same* agent that was selected
+at the top:
 
-This default prevents accidental silent data loss.
+```
+@ {research:5s} do
+  "Determine if github repo X supports our use cases" /done
+  "Find alternate repos with similar features" /done
+  "Summarize the comparison in three bullets" /done
+end
+```
+
+The selector picks one agent at the top; subsequent prompts inside
+the block bypass the selector and route to that pinned instance.
+Outside the block, normal selector semantics resume.
+
+If the pinned agent becomes unavailable mid-block (crash, kill,
+disconnect), the block fails immediately at the next prompt
+regardless of the original wait config — there is no implicit
+re-pick. Users who want failover must structure the block with an
+explicit `else`:
+
+```
+@ {research:5s} do
+  "..." /done
+  "..." /done
+end else log "research session lost"
+```
+
+## Output capture
+
+The dispatch operator does not capture stdout — agent output streams
+to the agent's own terminal. For scripts that need to *read* an
+agent's response, three conventions exist, in increasing order of
+cleanliness:
+
+1. **Asciicast scrape.** The runtime records each agent's PTY in
+   asciicast v2 format with a rolling buffer
+   (`asciicast-recorder.js`). The shell can slice the recording
+   from dispatch-start to sentinel-arrival, strip ANSI escape
+   sequences, and return the captured text. Universal but inherits
+   terminal-formatting messiness (line wrap, partial redraws,
+   cursor-positioning).
+
+2. **Marker-delimited extraction.** Rewrite the prompt to wrap the
+   machine-readable answer between unique markers:
+
+   ```
+   @ {research:30s} "summarize $url. Wrap your answer in
+     <<<ANS:NONCE>>>...<<<END:NONCE>>>." /done
+   ```
+
+   Script extracts the substring between markers from the asciicast
+   slice. Robust to formatting quirks; verbose at the call site.
+
+3. **Side-channel via holo.** MCP-aware agents (Claude Code, Codex
+   CLI) can emit structured tool results. The runtime subscribes to
+   a holo channel keyed on the dispatch nonce; the agent posts its
+   answer through an MCP tool call. Cleanest for structured data;
+   only available for MCP-aware agents.
+
+The runtime should provide a builtin (e.g. `@capture`) that uses #1
+by default and #3 when available. v1 commits to #1 and #2; #3 is
+opt-in per agent.
 
 ## Worked examples
 
 ```
-{*} $url                                  # any worker, wait forever
-{*:5s} $url else log "dropped"            # any worker, 5s patience, drop on timeout
-{*:0} $url else queue $url                # try-once, queue if all busy
+# Single dispatch, default agent (from $AI_AGENT)
+@ /usage
 
-{audio:5s} $clip                          # tag-filtered pool
-{java>=11, mem>2GB:30s} $build else fail  # capability-gated
-{gpu, cpu<70:5s,fifo} $infer              # mixed static + dynamic, FIFO waiting
-{gpu:0} $infer else cpu_fallback $infer   # GPU if free, else CPU
-{!busy, region=eu:10s} $req               # negation + equality
-{(gpu or tpu), mem>2GB:5s} $job           # grouped OR
-```
+# Pick a coding agent, fire-and-forget
+@ {coding} "lint this file: $file"
 
-A typical loop:
-
-```
-for url in $urls; do
-  {*:5s} $url else log "no worker for $url"
+# Bounded-concurrency loop — fan iterations across all chrome droids
+for url in $(cat list); do
+  @ {chrome:30s} "open $url and report the title" /done else log "skip $url"
 done
+wait                            # block until every outstanding /done lands
+
+# Same-agent conversation continuation
+@ {research:5s} do
+  "Summarize the differences between repo X and repo Y" /done
+  "Of those, which would matter most to a small team?" /done
+  "Output the answer as JSON: {choice, reason}" /done
+end
+
+# Strong-then-cheap fallback
+@ {model=claude-sonnet-4:0} "$task" /done else \
+  @ {model=claude-haiku-4:5s} "$task" /done
+
+# Broadcast — ask every coding agent the same question
+@ [coding:10s] "what's wrong with this code?" /done
+
+# Heredoc prompt with shell expansion
+@ {research:30s} <<END /done
+Compare the security postures of $repo_a and $repo_b.
+Cite specific commit hashes from the last 30 days.
+END
 ```
 
-Reads as: *"from the pool of all workers, dispatch `$url`; wait up to
-5 seconds; if no worker frees up, log and move on."*
+## Default selector — `$AI_AGENT`
 
-## Design decisions to lock in before extending
+A bare `@ <prompt>` (no pool clause) uses the selector in `$AI_AGENT`,
+which holds a *selector expression*, not just a name:
 
-1. **Static vs. dynamic attribute declaration on workers.** This drives
-   failure-mode behavior (fail-fast vs. wait) and must be known by the
-   runtime before the selector can be evaluated correctly.
-2. **Default timeout policy.** Strict (error on timeout) is the
-   recommended default; lenient (silent drop) requires explicit opt-in
-   via `else skip`. Changing this default later is user-visible and
-   risky.
+```
+AI_AGENT='{model=claude-sonnet-4, region=us}'
+@ "what's the time?"          # uses $AI_AGENT
+@ {model=gpt-5} "..."         # explicit override per call
+```
 
-## Reserved for later versions
+Because `{` and `}` are bash brace-expansion metacharacters, the
+selector must be quoted on assignment. The shell fork's parser
+recognizes the quoted form when re-injecting `$AI_AGENT` into a
+dispatch.
 
-- **Preference vs. requirement.** A `?` marker for soft constraints,
-  e.g. `{gpu?, cpu:5s}` meaning "prefer GPU, accept CPU." Not in v1.
-- **Capacity overrides.** A numeric position in the selector for "use
-  at most N matching workers," e.g. `{audio:4, 5s}`. Syntax not yet
-  finalized; may conflict with duration parsing.
-- **Cost or weight in selection.** Ordering hints among matching
-  workers, e.g. `{gpu order_by cost:5s}`. Not in v1.
-- **Sibling fan-out operator `[*]`.** Broadcast the input to *every*
-  matching worker rather than dispatching to one. Different operator,
-  different semantics; reserved for a future addition.
+## Pipelines and prompt expansion
+
+- The prompt goes through normal bash expansion (variables, command
+  substitution, quoting, heredocs) before injection. Word-split
+  tokens are rejoined with single spaces — agents see one string,
+  not an argv.
+- `cat foo | @ {sel} "..."` means *paste the contents of `foo` as
+  keystrokes into the selected agent's PTY, then send the prompt*.
+  Bracketed-paste mode is used where the agent's terminal supports
+  it.
+
+## Sync barrier
+
+A bare `wait` (analogous to bash's job-control `wait`) blocks until
+every outstanding sentinel has been received. Combined with the
+fire-and-forget loop pattern, this gives clean barrier semantics:
+
+```
+for url in $(cat list); do
+  @ {chrome:30s} "..." /done
+done
+wait                            # all chrome dispatches have landed /done
+```
+
+`wait <selector>` is reserved for v2 (block until all dispatches
+matching the selector complete).
+
+## Design decisions locked
+
+1. **Static vs. dynamic attribute declaration.** Source of truth is
+   the registry (holo announce). Selectors do not distinguish
+   syntactically; failure mode is determined by the registry.
+2. **Strict default on timeout.** Unmet wait_config raises an error
+   unless an `else` clause is present. `else skip` to drop silently.
+3. **`{}` picks one; `[]` broadcasts to all.** Both are v1.
+4. **Sentinel-based completion detection.** No regex on per-agent
+   prompt patterns. The agent self-announces via `/done`.
+5. **Stickiness is explicit via `do…end`.** No implicit sticky-
+   routing across separate `@` calls.
+6. **`{sel}` defaults to the registry pool default**, not forever.
+   `:inf` exists for explicit forever-waits.
+
+## Open / deferred
+
+- **Static / dynamic call-site visibility.** Whether to mark dynamic
+  attributes syntactically (e.g. `@cpu<70`) so a reader can predict
+  the failure mode without consulting the registry. Defer until users
+  report selector debugging pain.
+- **Cost-weighted ordering.** `{coding order_by cost}`. Selectors
+  with cost predicates (`cost_per_mtok<0.05`) cover most cases; the
+  ordering construct is deferred.
+- **Capacity overrides.** `{coding:4;5s}` — "use up to 4 matches"
+  inside a single dispatch. Syntax not finalized; may conflict with
+  the duration parser.
+- **Soft constraints.** `{gpu?, cpu:5s}` — "prefer GPU, accept CPU."
+  v2.
+- **Multiple sentinels.** `/progress`, `/error` for streaming /
+  failure events. v2.
+- **Named pools.** `{pool:east, gpu}`. v2; assumes single ambient
+  pool today.
+- **`wait <selector>`.** Barrier scoped to a subset of outstanding
+  dispatches. v2.
+
+## Notes for the shell fork
+
+- The `@` operator MUST scope to interactive REPL input or
+  explicitly-marked agent-script regions. A library `.sh` containing
+  `@ {...} "..."` should not silently fire dispatches when sourced
+  by a regular bash script. (The fork's parser tracks "interactive
+  command-line" vs. "sourced file body" already.)
+- `set -o posix` should disable the `@` operator entirely; it is not
+  POSIX.
+- `@`-line content goes through normal bash expansion. Quoting
+  semantics match bash exactly: `'$VAR'` literal, `"$VAR"` expanded.
+- The pool selector itself is parsed *after* shell quoting, so
+  `@ {model="gpt-4"} "..."` works the obvious way.
+- Per-invocation env override: `AI_AGENT='{...}' @ "..."` should
+  work, matching the existing `VAR=val command args` idiom. The
+  parser's command-lookup hook needs to recognize `@` here.
