@@ -55,6 +55,10 @@ extern COMMAND *clean_simple_command (COMMAND *);
 
 extern COMMAND *make_arith_command (WORD_LIST *);
 
+#if defined (AGENT_DISPATCH)
+extern COMMAND *make_agent_dispatch_command (WORD_DESC *, int);
+#endif
+
 extern COMMAND *make_select_command (WORD_DESC *, WORD_LIST *, COMMAND *, int);
 
 #if defined (COND_COMMAND)

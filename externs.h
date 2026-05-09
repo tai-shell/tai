@@ -52,6 +52,9 @@ extern void print_case_command_head (CASE_COM *);
 #if defined (DPAREN_ARITHMETIC)
 extern void print_arith_command (WORD_LIST *);
 #endif
+#if defined (AGENT_DISPATCH)
+extern void print_agent_dispatch_command (AGENT_DISPATCH_COM *);
+#endif
 #if defined (COND_COMMAND)
 extern void print_cond_command (COND_COM *);
 #endif

@@ -142,6 +142,9 @@ static int execute_select_command (SELECT_COM *);
 #if defined (DPAREN_ARITHMETIC)
 static int execute_arith_command (ARITH_COM *);
 #endif
+#if defined (AGENT_DISPATCH)
+static int execute_agent_dispatch_command (AGENT_DISPATCH_COM *);
+#endif
 #if defined (COND_COMMAND)
 static int execute_cond_node (COND_COM *);
 static int execute_cond_command (COND_COM *);
@@ -1175,6 +1178,12 @@ execute_command_internal (COMMAND *command, int asynchronous, int pipe_in, int p
 	}
 
       break;
+
+#if defined (AGENT_DISPATCH)
+    case cm_agent_dispatch:
+      exec_result = execute_agent_dispatch_command (command->value.AgentDispatch);
+      break;
+#endif
 
     default:
       command_error ("execute_command", CMDERR_BADTYPE, command->type, 0);
@@ -3887,6 +3896,22 @@ execute_if_command (IF_COM *if_command)
       return (execute_command (if_command->false_case));
     }
 }
+
+#if defined (AGENT_DISPATCH)
+/* tai v0 stub. Prints the captured prompt to stderr and returns
+   success. Replaced in a later commit by the real PTY-injection
+   dispatch (selector resolution via holo, prompt rewriting with
+   /done sentinel, asciicast slice for completion-watch). */
+static int
+execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
+{
+  fprintf (stderr, "[tai-agent: %s]\n",
+	   (agent_command->prompt && agent_command->prompt->word)
+	     ? agent_command->prompt->word
+	     : "(empty)");
+  return (EXECUTION_SUCCESS);
+}
+#endif
 
 #if defined (DPAREN_ARITHMETIC)
 static int

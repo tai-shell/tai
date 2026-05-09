@@ -70,7 +70,11 @@ enum r_instruction {
 /* Command Types: */
 enum command_type { cm_for, cm_case, cm_while, cm_if, cm_simple, cm_select,
 		    cm_connection, cm_function_def, cm_until, cm_group,
-		    cm_arith, cm_cond, cm_arith_for, cm_subshell, cm_coproc };
+		    cm_arith, cm_cond, cm_arith_for, cm_subshell, cm_coproc
+#if defined (AGENT_DISPATCH)
+		    , cm_agent_dispatch
+#endif
+		    };
 
 /* Possible values for the `flags' field of a WORD_DESC. */
 #define W_HASDOLLAR	(1 << 0)	/* Dollar sign present. */
@@ -222,6 +226,9 @@ typedef struct command {
 #endif
     struct subshell_com *Subshell;
     struct coproc_com *Coproc;
+#if defined (AGENT_DISPATCH)
+    struct agent_dispatch_com *AgentDispatch;
+#endif
   } value;
 } COMMAND;
 
@@ -332,6 +339,18 @@ typedef struct cond_com {
   WORD_DESC *op;
   struct cond_com *left, *right;
 } COND_COM;
+
+#if defined (AGENT_DISPATCH)
+/* The "agent dispatch" command — `@ {selector} prompt /done'. v0
+   stub: just holds the captured prompt as a single word. v1 will
+   split into selector_pool, prompt, sentinel, else_action.  See
+   docs/pool-dispatch-operator.md. */
+typedef struct agent_dispatch_com {
+  int flags;
+  int line;
+  WORD_DESC *prompt;
+} AGENT_DISPATCH_COM;
+#endif
 
 /* The "simple" command.  Just a collection of words and redirects. */
 typedef struct simple_com {

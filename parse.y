@@ -395,6 +395,7 @@ static FILE *yyerrstream;
 
 /* More general tokens. yylex () knows how to make these. */
 %token <word> WORD ASSIGNMENT_WORD REDIR_WORD
+%token <word> AT_DISPATCH
 %token <number> NUMBER
 %token <word_list> ARITH_CMD ARITH_FOR_EXPRS
 %token <command> COND_CMD
@@ -417,6 +418,7 @@ static FILE *yyerrstream;
 %type <command> arith_command
 %type <command> cond_command
 %type <command> arith_for_command
+%type <command> agent_dispatch_command
 %type <command> coproc
 %type <command> comsub funsub
 %type <command> function_def function_body if_command elif_clause subshell
@@ -891,6 +893,8 @@ shell_command:	for_command
 			{ $$ = $1; }
 	|	arith_for_command
 			{ $$ = $1; }
+	|	agent_dispatch_command
+			{ $$ = $1; }
 	;
 
 for_command:	FOR WORD newline_list DO compound_list DONE
@@ -1212,7 +1216,11 @@ cond_command:	COND_START COND_CMD COND_END
 			  $$ = $2;
 			  if (compoundcmd_top >= 0) compoundcmd_top--;	/* COND_END */
 			}
-	; 
+	;
+
+agent_dispatch_command: AT_DISPATCH
+			{ $$ = make_agent_dispatch_command ($1, line_number); }
+	;
 
 elif_clause:	ELIF compound_list THEN compound_list
 			{ $$ = make_if_command ($2, $4, (COMMAND *)NULL); }
@@ -3670,11 +3678,7 @@ read_token (int command)
   /* tai agent-dispatch operator. When `@' appears at command-start
      position outside quoting, hand off to parse_at_dispatch() to
      consume the rest of the dispatch (selector, prompt, sentinel,
-     else action). v0 stub: parse_at_dispatch returns -2 (no-op) so
-     `@' falls through to the regular word lexer and is treated as
-     a normal command word. Mid-word `@' (e.g. ssh user@host) never
-     reaches this point: the word lexer reads it directly without
-     re-entering read_token. See docs/pool-dispatch-operator.md. */
+     else action). See docs/pool-dispatch-operator.md. */
   if MBTEST(character == '@' && reserved_word_acceptable (last_read_token))
     {
       result = parse_at_dispatch (character);
@@ -4976,22 +4980,76 @@ parse_dparen (int c)
 }
 
 #if defined (AGENT_DISPATCH)
-/* tai v0 stub: signal "not handled" so the caller falls through to
-   the regular word lexer. This validates the lexer hook fires at
-   the right input positions without introducing any new tokens or
-   AST nodes. Subsequent commits will replace the body with actual
-   prompt capture, AT_DISPATCH token emission, and AST construction.
+/* tai agent-dispatch operator. The lexer has just consumed `@' at
+   command-start position. Read the rest of the current input line
+   from the lexer's buffered input via shell_getc(), package it as
+   a WORD_DESC, and emit AT_DISPATCH so the grammar reduces it into
+   an agent-dispatch command. The trailing newline is pushed back so
+   the parser sees the simple_list_terminator.
 
-   Set TAI_DEBUG=1 in the environment to print a diagnostic when the
-   hook fires; default is silent so the bash test suite is not
-   disturbed. */
+   v0 behavior: the entire post-@ line (after leading blanks) becomes
+   the prompt verbatim; selector-pool parsing, /done sentinels, and
+   `else' actions are not yet split out. Future work: parse `{sel}'
+   / `[sel]', extract trailing `/done', recognize `else <action>'.
+
+   Note: read_a_line() reads via yy_getc (raw input stream) and
+   would see EOF here because the lexer's shell_getc has already
+   pulled the line into shell_input_line. shell_getc() is the right
+   reader.
+
+   Returns -2 to fall back to ordinary word lexing (reserved for
+   future "this isn't really a dispatch" cases like `@@' or `@(' if
+   those grow special meaning). Set TAI_DEBUG=1 for a stderr trace
+   of what was captured. */
 static int
 parse_at_dispatch (int c)
 {
+  char *line, *p;
+  size_t indx, alloc;
+  int ch;
+  WORD_DESC *wd;
+
+  alloc = 64;
+  indx = 0;
+  line = (char *)xmalloc (alloc);
+
+  /* v0: stop at any unquoted command terminator. We do not yet honour
+     bash's full quoting / heredoc / process-substitution rules, so
+     prompts that need to contain literal `;', `\n' etc. must be
+     escaped with backslash. Future work folds this into bash's real
+     word-lexer machinery. */
+  for (;;)
+    {
+      ch = shell_getc (1);
+      if (ch == EOF || ch == '\n' || ch == ';')
+	break;
+      if (indx + 1 >= alloc)
+	{
+	  alloc *= 2;
+	  line = (char *)xrealloc (line, alloc);
+	}
+      line[indx++] = ch;
+    }
+  line[indx] = '\0';
+
+  /* Push the terminator back so the parser still sees it as the
+     simple_list_terminator (or list separator inside a compound
+     command body). EOF is left consumed; yylex synthesizes
+     yacc_EOF on the next call. */
+  if (ch != EOF)
+    shell_ungetc (ch);
+
+  for (p = line; *p == ' ' || *p == '\t'; p++)
+    ;
+
   if (getenv ("TAI_DEBUG"))
-    fprintf (stderr, "tai: agent-dispatch hook fired at line %d\n",
-	     line_number);
-  return -2;
+    fprintf (stderr, "tai: agent-dispatch capture at line %d: %s\n",
+	     line_number, p);
+
+  wd = make_word (p);
+  free (line);
+  yylval.word = wd;
+  return AT_DISPATCH;
 }
 #endif
 

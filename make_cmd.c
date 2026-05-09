@@ -409,6 +409,28 @@ make_arith_command (WORD_LIST *exp)
 #endif
 }
 
+#if defined (AGENT_DISPATCH)
+COMMAND *
+make_agent_dispatch_command (WORD_DESC *prompt, int lineno)
+{
+  COMMAND *command;
+  AGENT_DISPATCH_COM *temp;
+
+  command = (COMMAND *)xmalloc (sizeof (COMMAND));
+  command->value.AgentDispatch = temp = (AGENT_DISPATCH_COM *)xmalloc (sizeof (AGENT_DISPATCH_COM));
+
+  temp->flags = 0;
+  temp->line = lineno;
+  temp->prompt = prompt;
+
+  command->type = cm_agent_dispatch;
+  command->redirects = (REDIRECT *)NULL;
+  command->flags = 0;
+
+  return (command);
+}
+#endif
+
 #if defined (COND_COMMAND)
 struct cond_com *
 make_cond_node (int type, WORD_DESC *op, struct cond_com *left, struct cond_com *right)

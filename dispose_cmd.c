@@ -177,6 +177,19 @@ dispose_command (COMMAND *command)
       }
 #endif /* DPAREN_ARITHMETIC */
 
+#if defined (AGENT_DISPATCH)
+    case cm_agent_dispatch:
+      {
+	register AGENT_DISPATCH_COM *c;
+
+	c = command->value.AgentDispatch;
+	if (c->prompt)
+	  dispose_word (c->prompt);
+	free (c);
+	break;
+      }
+#endif /* AGENT_DISPATCH */
+
 #if defined (COND_COMMAND)
     case cm_cond:
       {

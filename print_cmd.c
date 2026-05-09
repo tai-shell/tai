@@ -236,6 +236,12 @@ make_command_string_internal (COMMAND *command)
 	  break;
 #endif
 
+#if defined (AGENT_DISPATCH)
+	case cm_agent_dispatch:
+	  print_agent_dispatch_command (command->value.AgentDispatch);
+	  break;
+#endif
+
 #if defined (COND_COMMAND)
 	case cm_cond:
 	  print_cond_command (command->value.Cond);
@@ -873,6 +879,16 @@ print_arith_command (WORD_LIST *arith_cmd_list)
   cprintf ("((");
   command_print_word_list (arith_cmd_list, " ");
   cprintf ("))");
+}
+#endif
+
+#if defined (AGENT_DISPATCH)
+void
+print_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
+{
+  cprintf ("@");
+  if (agent_command->prompt && agent_command->prompt->word)
+    cprintf (" %s", agent_command->prompt->word);
 }
 #endif
 
