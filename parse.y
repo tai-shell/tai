@@ -204,6 +204,9 @@ static char *parse_compound_assignment (size_t *);
 static int parse_dparen (int);
 static int parse_arith_cmd (char **, int);
 #endif
+#if defined (AGENT_DISPATCH)
+static int parse_at_dispatch (int);
+#endif
 #if defined (COND_COMMAND)
 static void cond_error (void);
 static COND_COM *cond_expr (void);
@@ -3663,6 +3666,24 @@ read_token (int command)
   if (parser_state & PST_REGEXP)
     goto tokword;
 
+#if defined (AGENT_DISPATCH)
+  /* tai agent-dispatch operator. When `@' appears at command-start
+     position outside quoting, hand off to parse_at_dispatch() to
+     consume the rest of the dispatch (selector, prompt, sentinel,
+     else action). v0 stub: parse_at_dispatch returns -2 (no-op) so
+     `@' falls through to the regular word lexer and is treated as
+     a normal command word. Mid-word `@' (e.g. ssh user@host) never
+     reaches this point: the word lexer reads it directly without
+     re-entering read_token. See docs/pool-dispatch-operator.md. */
+  if MBTEST(character == '@' && reserved_word_acceptable (last_read_token))
+    {
+      result = parse_at_dispatch (character);
+      if (result != -2)
+	return result;
+      /* fall through to regular word lexing */
+    }
+#endif
+
   /* Shell meta-characters. */
   if MBTEST(shellmeta (character))
     {
@@ -4953,6 +4974,26 @@ parse_dparen (int c)
 
   return -2;			/* XXX */
 }
+
+#if defined (AGENT_DISPATCH)
+/* tai v0 stub: signal "not handled" so the caller falls through to
+   the regular word lexer. This validates the lexer hook fires at
+   the right input positions without introducing any new tokens or
+   AST nodes. Subsequent commits will replace the body with actual
+   prompt capture, AT_DISPATCH token emission, and AST construction.
+
+   Set TAI_DEBUG=1 in the environment to print a diagnostic when the
+   hook fires; default is silent so the bash test suite is not
+   disturbed. */
+static int
+parse_at_dispatch (int c)
+{
+  if (getenv ("TAI_DEBUG"))
+    fprintf (stderr, "tai: agent-dispatch hook fired at line %d\n",
+	     line_number);
+  return -2;
+}
+#endif
 
 /* We've seen a `(('.  Look for the matching `))'.  If we get it, return 1.
    If not, assume it's a nested subshell for backwards compatibility and

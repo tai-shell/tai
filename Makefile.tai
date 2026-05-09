@@ -40,6 +40,12 @@ linux-image:
 	  -f Dockerfile.linux -t $(IMAGE) --load .
 
 linux: linux-image
+	# Defensively remove host-side configure outputs at the source
+	# root. A quoted `#include "config.h"' in a source-tree .c file
+	# finds ./config.h before ./$(BUILDDIR)/config.h, so a stale
+	# host config.h breaks cross builds with cryptic struct-field
+	# errors. rm -f is a no-op when the files are absent.
+	rm -f config.h buildconf.h Makefile stamp-h
 	mkdir -p $(BUILDDIR)
 	docker run --rm \
 	  -v $(PWD):/src -w /src/$(BUILDDIR) \

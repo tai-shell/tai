@@ -209,3 +209,11 @@
 /* Define to 1 if you want posix mode to restrict shell function names to
    shell NAMEs. */
 /* #define POSIX_RESTRICT_FUNCNAME 0 */
+
+/* Define AGENT_DISPATCH to enable the tai-fork agent-dispatch operator
+   `@'. When defined, `@' at command-start position invokes the lexer
+   hook in parse.y that captures the rest of the line as a prompt to an
+   AI agent. Disable to obtain a vanilla-bash build for diff comparison
+   or upstream-merge work. See docs/pool-dispatch-operator.md for the
+   language spec. */
+#define AGENT_DISPATCH
