@@ -39,6 +39,15 @@ jobs:
           - runner: ubuntu-latest
             target: linux-x86_64
             artifact: tai-linux-x86_64
+            builder: native
+          # musl build for Alpine-based environments (notably the
+          # c2w-net Docker container that the desktop SPA ships with).
+          # Built inside an alpine:3.19 container on the ubuntu runner
+          # so the resulting binary links against musl, not glibc.
+          - runner: ubuntu-latest
+            target: linux-x86_64-musl
+            artifact: tai-linux-x86_64-musl
+            builder: alpine
 
     steps:
       - uses: actions/checkout@v4
@@ -57,9 +66,11 @@ jobs:
           "${BISON_DIR}/bison" --version | head -1
 
       - name: Verify bison version
+        if: matrix.builder != 'alpine'
         run: bison --version | head -1
 
-      - name: Configure & build
+      - name: Configure & build (native)
+        if: matrix.builder != 'alpine'
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             # Universal2: pass -arch flags through CFLAGS+LDFLAGS.
@@ -76,6 +87,25 @@ jobs:
             make -j$(nproc)
           fi
           ls -la bash
+
+      # Build inside an alpine container so the resulting binary
+      # links against musl libc — required for the desktop SPA's
+      # c2w-net container (Alpine 3.19) and the WASM VM that ships
+      # with it. Image cache lets the apk add complete in seconds
+      # on subsequent runs.
+      - name: Configure & build (alpine/musl)
+        if: matrix.builder == 'alpine'
+        run: |
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            --platform linux/amd64 \
+            alpine:3.19 sh -c '
+              set -e
+              apk add --no-cache build-base bison
+              ./configure --quiet
+              make -j$(nproc)
+              ls -la bash
+            '
 
       - name: Stage artifact
         run: |
