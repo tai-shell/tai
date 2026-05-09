@@ -1,0 +1,61 @@
+# tai-specific build orchestration.
+#
+# Bash's `./configure` generates a top-level `Makefile` from `Makefile.in`,
+# so this file is named `Makefile.tai` to avoid the collision and is
+# invoked explicitly:
+#
+#     make -f Makefile.tai <target>
+#
+# Native (host) builds use bash's own flow at the repo root:
+#
+#     ./configure && make
+#
+# This wrapper handles cross-environment builds via Docker. Cross builds
+# go into ./build-<target>/ (out-of-tree) so they do not trample the
+# host's build artifacts at the repo root.
+
+IMAGE     ?= tai-bash-build
+PLATFORM  ?= linux/amd64
+BUILDDIR  ?= build-linux
+
+.PHONY: linux linux-image linux-shell linux-clean help
+
+help:
+	@echo "tai build wrapper — invoke with: make -f Makefile.tai <target>"
+	@echo ""
+	@echo "Targets:"
+	@echo "  linux         build a Linux bash binary in ./$(BUILDDIR)/"
+	@echo "                  out-of-tree, does not touch the host build"
+	@echo "  linux-image   (re)build the Linux build-env Docker image"
+	@echo "  linux-shell   open an interactive shell in the build env"
+	@echo "  linux-clean   remove ./$(BUILDDIR)/"
+	@echo ""
+	@echo "Variables (override on the command line):"
+	@echo "  PLATFORM=$(PLATFORM)   pass linux/arm64 to cross-build for arm"
+	@echo "  IMAGE=$(IMAGE)"
+	@echo "  BUILDDIR=$(BUILDDIR)"
+
+linux-image:
+	docker buildx build --platform $(PLATFORM) \
+	  -f Dockerfile.linux -t $(IMAGE) --load .
+
+linux: linux-image
+	# Defensively remove host-side configure outputs at the source
+	# root. A quoted `#include "config.h"' in a source-tree .c file
+	# finds ./config.h before ./$(BUILDDIR)/config.h, so a stale
+	# host config.h breaks cross builds with cryptic struct-field
+	# errors. rm -f is a no-op when the files are absent.
+	rm -f config.h buildconf.h Makefile stamp-h
+	mkdir -p $(BUILDDIR)
+	docker run --rm \
+	  -v $(PWD):/src -w /src/$(BUILDDIR) \
+	  --platform $(PLATFORM) $(IMAGE) \
+	  bash -c '../configure --quiet && make -j$$(nproc) && ./bash --version'
+
+linux-shell: linux-image
+	docker run --rm -it \
+	  -v $(PWD):/src \
+	  --platform $(PLATFORM) $(IMAGE) bash
+
+linux-clean:
+	rm -rf $(BUILDDIR)
