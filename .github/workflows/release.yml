@@ -131,9 +131,23 @@ jobs:
               *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
             esac
           fi
-          "./out/${{ matrix.artifact }}" --version
-          # Smoke test: arithmetic + a simple `for' loop.
-          "./out/${{ matrix.artifact }}" -c 'echo 1+1=$((1+1)); for i in 1 2 3; do echo iter $i; done'
+          # Smoke tests. The musl build links against
+          # /lib/ld-musl-x86_64.so.1 — only present in Alpine, so
+          # run those tests inside the same alpine container we
+          # built in. Native (glibc / Mach-O) artifacts run on the
+          # host runner directly.
+          if [ "${{ matrix.builder }}" = "alpine" ]; then
+            docker run --rm \
+              -v "$PWD/out":/out -w /out \
+              --platform linux/amd64 \
+              alpine:3.19 sh -c '
+                "./${{ matrix.artifact }}" --version
+                "./${{ matrix.artifact }}" -c "echo 1+1=\$((1+1)); for i in 1 2 3; do echo iter \$i; done"
+              '
+          else
+            "./out/${{ matrix.artifact }}" --version
+            "./out/${{ matrix.artifact }}" -c 'echo 1+1=$((1+1)); for i in 1 2 3; do echo iter $i; done'
+          fi
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
