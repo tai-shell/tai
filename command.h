@@ -357,6 +357,7 @@ typedef struct agent_dispatch_com {
   WORD_DESC *selector;
   WORD_DESC *prompt;
   WORD_DESC *sentinel;
+  struct command *else_action;	/* `else <cmd>' fallback, or NULL. */
 } AGENT_DISPATCH_COM;
 #endif
 

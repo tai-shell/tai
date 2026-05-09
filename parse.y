@@ -320,12 +320,15 @@ static int simplecmd_lineno = -1;
 static int save_simple_lineno = -1;
 
 #if defined (AGENT_DISPATCH)
-/* parse_at_dispatch returns AT_DISPATCH with the prompt as
-   yylval.word; the matching pool selector and trailing /<id>
-   sentinel (if any) are parked here for the agent_dispatch_command
-   grammar action to pick up. */
-static WORD_DESC *agent_pending_selector = (WORD_DESC *)NULL;
-static WORD_DESC *agent_pending_sentinel = (WORD_DESC *)NULL;
+/* AT_DISPATCH carries this struct as its yylval, so all three pieces
+   captured by parse_at_dispatch survive any recursive parse_at_dispatch
+   call inside an `else' action. The grammar action frees the struct
+   and assembles the AGENT_DISPATCH_COM. */
+struct agent_dispatch_tok {
+  WORD_DESC *selector;
+  WORD_DESC *prompt;
+  WORD_DESC *sentinel;
+};
 #endif
 
 /* The line number in a script on which a function definition starts. */
@@ -392,6 +395,9 @@ static FILE *yyerrstream;
   REDIRECT *redirect;
   ELEMENT element;
   PATTERN_LIST *pattern;
+#if defined (AGENT_DISPATCH)
+  struct agent_dispatch_tok *agent_dispatch_tok;
+#endif
 }
 
 /* Reserved words.  Members of the first group are only recognized
@@ -404,7 +410,7 @@ static FILE *yyerrstream;
 
 /* More general tokens. yylex () knows how to make these. */
 %token <word> WORD ASSIGNMENT_WORD REDIR_WORD
-%token <word> AT_DISPATCH
+%token <agent_dispatch_tok> AT_DISPATCH
 %token <number> NUMBER
 %token <word_list> ARITH_CMD ARITH_FOR_EXPRS
 %token <command> COND_CMD
@@ -1229,11 +1235,20 @@ cond_command:	COND_START COND_CMD COND_END
 
 agent_dispatch_command: AT_DISPATCH
 			{
-			  WORD_DESC *sel = agent_pending_selector;
-			  WORD_DESC *sentinel = agent_pending_sentinel;
-			  agent_pending_selector = (WORD_DESC *)NULL;
-			  agent_pending_sentinel = (WORD_DESC *)NULL;
-			  $$ = make_agent_dispatch_command (sel, $1, sentinel, line_number);
+			  $$ = make_agent_dispatch_command ($1->selector,
+							    $1->prompt,
+							    $1->sentinel,
+							    (COMMAND *)NULL,
+							    line_number);
+			  free ($1);
+			}
+	|	AT_DISPATCH ELSE command
+			{
+			  $$ = make_agent_dispatch_command ($1->selector,
+							    $1->prompt,
+							    $1->sentinel,
+							    $3, line_number);
+			  free ($1);
 			}
 	;
 
@@ -5050,11 +5065,13 @@ parse_at_dispatch (int c)
   char *sel_buf, *prompt_buf;
   size_t sel_indx, sel_alloc, prompt_indx, prompt_alloc;
   int ch, opener, closer, depth;
-  WORD_DESC *sel_wd, *prompt_wd;
+  WORD_DESC *sel_wd, *prompt_wd, *sentinel_wd;
+  struct agent_dispatch_tok *tok;
 
   sel_buf = prompt_buf = NULL;
   sel_indx = prompt_indx = 0;
   sel_alloc = prompt_alloc = 0;
+  sentinel_wd = (WORD_DESC *)NULL;
 
   /* Skip whitespace between `@' and the selector / prompt. */
   ch = agent_skip_blanks ();
@@ -5117,6 +5134,48 @@ parse_at_dispatch (int c)
   if (ch != EOF)
     shell_ungetc (ch);
 
+  /* Look for the first whitespace-bounded `else' keyword in the
+     captured buffer. If present, this divides the prompt+sentinel
+     (before) from the else action (after). Push only the action
+     text back into the lexer's input via shell_ungets, and inject
+     ELSE as the very next token via token_to_read so the bash
+     parser sees `... AT_DISPATCH ELSE <action>'. Using
+     token_to_read avoids re-tokenizing `else' as a keyword (which
+     would require enabling reserved-word recognition after
+     AT_DISPATCH and creates dozens of grammar conflicts).
+     v0 limitation: not quote-aware — `else' inside a quoted
+     segment of the prompt is still detected. */
+  {
+    size_t i;
+    for (i = 0; i + 4 < prompt_indx; i++)
+      {
+	if ((i == 0 || prompt_buf[i - 1] == ' ' || prompt_buf[i - 1] == '\t') &&
+	    prompt_buf[i] == 'e' && prompt_buf[i + 1] == 'l' &&
+	    prompt_buf[i + 2] == 's' && prompt_buf[i + 3] == 'e' &&
+	    (prompt_buf[i + 4] == ' ' || prompt_buf[i + 4] == '\t'))
+	  {
+	    /* Push back ONLY the action text (everything after
+	       `else' + the trailing whitespace), then arrange for
+	       ELSE to be returned on the next yylex call. */
+	    size_t action_at = i + 4;
+	    while (action_at < prompt_indx &&
+		   (prompt_buf[action_at] == ' ' ||
+		    prompt_buf[action_at] == '\t'))
+	      action_at++;
+	    if (action_at < prompt_indx)
+	      shell_ungets (prompt_buf + action_at);
+	    token_to_read = ELSE;
+	    /* Trim back to the whitespace before `else'. */
+	    while (i > 0 &&
+		   (prompt_buf[i - 1] == ' ' || prompt_buf[i - 1] == '\t'))
+	      i--;
+	    prompt_indx = i;
+	    prompt_buf[prompt_indx] = '\0';
+	    break;
+	  }
+      }
+  }
+
   /* Look for a trailing sync sentinel `/<id>'. Walk back over
      trailing blanks, then over identifier characters; if the char
      before that is `/' AND there is whitespace (or beginning-of-
@@ -5148,7 +5207,7 @@ parse_at_dispatch (int c)
 	char *id_buf = (char *)xmalloc (id_len + 1);
 	memcpy (id_buf, prompt_buf + id_end, id_len);
 	id_buf[id_len] = '\0';
-	agent_pending_sentinel = make_word (id_buf);
+	sentinel_wd = make_word (id_buf);
 	free (id_buf);
 
 	/* Trim back over the `/' and any whitespace before it. */
@@ -5166,19 +5225,22 @@ parse_at_dispatch (int c)
 	     line_number,
 	     sel_buf ? sel_buf : "(none)",
 	     prompt_buf,
-	     agent_pending_sentinel ? agent_pending_sentinel->word : "(none)");
+	     sentinel_wd ? sentinel_wd->word : "(none)");
 
   sel_wd = sel_buf ? make_word (sel_buf) : (WORD_DESC *)NULL;
   prompt_wd = make_word (prompt_buf);
   free (sel_buf);
   free (prompt_buf);
 
-  /* Stash both pieces. The grammar action assembles them into the
-     real AGENT_DISPATCH_COM via make_agent_dispatch_command(). We
-     piggy-back the selector and sentinel through static slots the
-     action picks up after AT_DISPATCH reduces. */
-  agent_pending_selector = sel_wd;
-  yylval.word = prompt_wd;
+  /* Pack all three captured pieces into a struct attached to the
+     AT_DISPATCH yylval. The grammar action unpacks and frees it.
+     This is recursion-safe — a nested parse_at_dispatch (e.g. in an
+     `else' action) gets its own struct. */
+  tok = (struct agent_dispatch_tok *)xmalloc (sizeof (struct agent_dispatch_tok));
+  tok->selector = sel_wd;
+  tok->prompt = prompt_wd;
+  tok->sentinel = sentinel_wd;
+  yylval.agent_dispatch_tok = tok;
   return AT_DISPATCH;
 }
 #endif

@@ -3919,14 +3919,20 @@ execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
     ? expand_string_unsplit_to_string (agent_command->prompt->word, 0)
     : (char *)NULL;
 
-  fprintf (stderr, "[tai-agent: sel=%s prompt=%s sentinel=%s]\n",
+  fprintf (stderr, "[tai-agent: sel=%s prompt=%s sentinel=%s else=%s]\n",
 	   sel_expanded ? sel_expanded : "(default)",
 	   prompt_expanded ? prompt_expanded : "",
 	   (agent_command->sentinel && agent_command->sentinel->word)
-	     ? agent_command->sentinel->word : "(none)");
+	     ? agent_command->sentinel->word : "(none)",
+	   agent_command->else_action ? "(set)" : "(none)");
 
   FREE (sel_expanded);
   FREE (prompt_expanded);
+
+  /* The stub never fails, so the else action does not run. The real
+     dispatch will run else_action when the wait_config timeout
+     expires without a sentinel match. For now, this just verifies
+     the AST holds a parsed action. */
 
   return (EXECUTION_SUCCESS);
 }

@@ -893,6 +893,11 @@ print_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
     cprintf (" %s", agent_command->prompt->word);
   if (agent_command->sentinel && agent_command->sentinel->word)
     cprintf (" /%s", agent_command->sentinel->word);
+  if (agent_command->else_action)
+    {
+      cprintf (" else ");
+      make_command_string_internal (agent_command->else_action);
+    }
 }
 #endif
 

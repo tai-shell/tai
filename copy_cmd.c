@@ -299,6 +299,7 @@ copy_agent_dispatch_command (AGENT_DISPATCH_COM *com)
   new_com->selector = com->selector ? copy_word (com->selector) : (WORD_DESC *)NULL;
   new_com->prompt = com->prompt ? copy_word (com->prompt) : (WORD_DESC *)NULL;
   new_com->sentinel = com->sentinel ? copy_word (com->sentinel) : (WORD_DESC *)NULL;
+  new_com->else_action = com->else_action ? copy_command (com->else_action) : (COMMAND *)NULL;
 
   return (new_com);
 }
