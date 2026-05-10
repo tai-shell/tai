@@ -66,6 +66,15 @@ configure.lineno
 /stdckdint.h
 /syntax.c
 /version.h
+# y.tab.c / y.tab.h are bison-generated from parse.y. Tracking
+# them in git looks tempting (lets users build without bison) but
+# bites: a fresh checkout's mtime ordering can leave y.tab.c
+# newer than parse.y, at which point `make' considers it
+# up-to-date and skips regeneration. Any parse.y edit then
+# silently fails to land in the binary. Untracked + bison
+# required for build.
+/y.tab.c
+/y.tab.h
 
 # Out-of-tree build directories used by Makefile.tai (linux, etc.)
 /build-*/
