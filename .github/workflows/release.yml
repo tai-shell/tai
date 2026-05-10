@@ -72,6 +72,12 @@ jobs:
       - name: Configure & build (native)
         if: matrix.builder != 'alpine'
         run: |
+          # Force regen of the bison output. y.tab.c / y.tab.h
+          # are .gitignore'd as of fix/untrack-generated-y-tab,
+          # but if a future change re-tracks them (or this commit
+          # is rolled back), keep the build robust by deleting
+          # whatever's there before make.
+          rm -f y.tab.c y.tab.h
           if [ "$RUNNER_OS" = "macOS" ]; then
             # Universal2: pass -arch flags through CFLAGS+LDFLAGS.
             # Apple's clang builds fat .o files; the linker produces
@@ -117,6 +123,9 @@ jobs:
               set -e
               apk add --no-cache build-base bison
               touch aclocal.m4 configure.ac configure
+              # Force regen of bison output (see comment in
+              # native build step).
+              rm -f y.tab.c y.tab.h
               ./configure --quiet --without-bash-malloc
               make -j$(nproc)
               ls -la bash
