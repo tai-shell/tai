@@ -10,9 +10,79 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <libgen.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "boot.h"
+
+/* Locate the directory containing the running binary, resolving any
+   symlinks (so /tmp/tcsh -> /usr/local/bin/tai gives /usr/local/bin).
+   On success returns 0 and writes the directory into `out` (which
+   must have room for PATH_MAX bytes). Returns -1 on failure. */
+static int
+tai_resolve_exe_dir (char *out)
+{
+  char raw[PATH_MAX];
+  uint32_t size = sizeof raw;
+
+  if (_NSGetExecutablePath (raw, &size) != 0)
+    return -1;
+
+  char resolved[PATH_MAX];
+  if (realpath (raw, resolved) == NULL)
+    return -1;
+
+  /* dirname() may modify its input on some platforms; give it a copy. */
+  char copy[PATH_MAX];
+  strncpy (copy, resolved, sizeof copy - 1);
+  copy[sizeof copy - 1] = '\0';
+
+  const char *dir = dirname (copy);
+  if (dir == NULL)
+    return -1;
+
+  strncpy (out, dir, PATH_MAX - 1);
+  out[PATH_MAX - 1] = '\0';
+  return 0;
+}
+
+/* Build a sys.path-setup Python snippet that prepends three paths
+   computed from `exe_dir`. The order matches the precedence rule:
+   vendored holo wins over the runtime package wins over the pip
+   dep closure. Returns a malloc'd string the caller must free.
+
+   We don't quote-escape exe_dir for the embedded Python string
+   literal because realpath() output won't contain quote chars on
+   any plausible filesystem we care about. */
+static char *
+tai_format_path_setup (const char *exe_dir)
+{
+  /* Liberal upper bound: 3 path strings (~PATH_MAX each) +
+     boilerplate. PATH_MAX is 1024 on macOS, so ~4 KiB worst case. */
+  size_t cap = (PATH_MAX + 64) * 3 + 128;
+  char *buf = malloc (cap);
+  if (buf == NULL)
+    return NULL;
+
+  /* Dev-tree layout (matches `make` output):
+       <exe_dir>/vendor/holo/src         vendored holo
+       <exe_dir>/embedded/runtime        tai_runtime package
+       <exe_dir>/build/site-packages     pip-installed deps
+     For an installed binary, the post-install hook should drop the
+     same three sibling dirs next to the executable, or eventually
+     freeze them into the binary so this lookup becomes a no-op. */
+  snprintf (buf, cap,
+	    "import sys\n"
+	    "sys.path.insert(0, '%s/build/site-packages')\n"
+	    "sys.path.insert(0, '%s/embedded/runtime')\n"
+	    "sys.path.insert(0, '%s/vendor/holo/src')\n",
+	    exe_dir, exe_dir, exe_dir);
+  return buf;
+}
 
 int
 tai_embedded_serve_stdio (void)
@@ -50,25 +120,29 @@ tai_embedded_serve_stdio (void)
      baked in at build time via -D in EMBED_CFLAGS. We prepend it
      to sys.path so `import holo` finds the vendored tree before any
      other site-packages copy. */
-#ifndef TAI_VENDOR_HOLO_PATH
-#  error "TAI_VENDOR_HOLO_PATH must be -D'd at build time (see Makefile.in)"
-#endif
-#ifndef TAI_EMBED_SITE_PKGS
-#  error "TAI_EMBED_SITE_PKGS must be -D'd at build time (see Makefile.in)"
-#endif
-#ifndef TAI_EMBED_RUNTIME
-#  error "TAI_EMBED_RUNTIME must be -D'd at build time (see Makefile.in)"
-#endif
+  /* Compute the three sys.path entries from the binary's location at
+     runtime (not from build-time -D macros, so the binary relocates
+     cleanly). Order matters: vendored holo must come BEFORE any
+     site-packages copy so a system-wide pip-installed holo (if any)
+     doesn't shadow our pin. */
+  char exe_dir[PATH_MAX];
+  if (tai_resolve_exe_dir (exe_dir) != 0)
+    {
+      fprintf (stderr, "tai: could not resolve executable path\n");
+      Py_Finalize ();
+      return 70;
+    }
 
-  /* Wire sys.path so the tai_runtime package, the dep closure, and the
-     vendored holo tree are all reachable. Order matters: vendored holo
-     must come BEFORE any site-packages copy so a system-wide pip-installed
-     holo (if any) doesn't shadow our pin. */
-  if (PyRun_SimpleString (
-	"import sys\n"
-	"sys.path.insert(0, '" TAI_EMBED_SITE_PKGS "')\n"
-	"sys.path.insert(0, '" TAI_EMBED_RUNTIME "')\n"
-	"sys.path.insert(0, '" TAI_VENDOR_HOLO_PATH "')\n") != 0)
+  char *path_setup = tai_format_path_setup (exe_dir);
+  if (path_setup == NULL)
+    {
+      fprintf (stderr, "tai: out of memory composing sys.path setup\n");
+      Py_Finalize ();
+      return 70;
+    }
+  int path_rc = PyRun_SimpleString (path_setup);
+  free (path_setup);
+  if (path_rc != 0)
     {
       fprintf (stderr, "tai: sys.path setup failed\n");
       Py_Finalize ();
