@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "holo"
+version = "0.1.0a32"
+description = "Browser + screen automation primitive for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["browser-automation", "ai-agents", "mcp", "screen-automation"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+  "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
+  "pyperclip>=1.8",
+  "pyautogui>=0.9.54",
+  "websockets>=13.0",
+  "mcp>=1.2",
+  # Bundled CA store for HTTPS — PyInstaller-bundled Python's OpenSSL
+  # uses CA paths from the build runner that don't exist on the user's
+  # machine, so `urllib` against GitHub Releases fails on first run.
+  "certifi>=2024.2.2",
+  # Pure-Python mDNS / DNS-SD; speaks the multicast protocol directly so
+  # neither Avahi nor Bonjour need to be installed on Linux/Windows.
+  # Used by `holo mcp --announce` to broadcast session metadata to the
+  # companion desktop app. LGPL 2.1+ — bundled binaries should ship a
+  # NOTICE entry and the library source must remain replaceable.
+  #
+  # Pinned to `<0.40` because zeroconf 0.40.0+ stopped shipping a
+  # `py3-none-any` pure-Python wheel AND only publishes arm64 macOS
+  # wheels (no x86_64). Our universal2 PyInstaller build needs either
+  # a fusable arm64+x86_64 pair or a pure-Python fallback — 0.40+
+  # provides neither and the workflow's "fallback to latest with x86_64"
+  # path silently downgraded the dep. 0.39.4 ships both arches AND
+  # py3-none-any, so the workflow's pure-Python swap path works cleanly.
+  "zeroconf>=0.39,<0.40",
+  # Required by zeroconf <0.40 for asyncio.timeout-style cancellation
+  # on Pythons before 3.11. Listing it explicitly so the install is
+  # reproducible regardless of which transitive marker pip evaluates.
+  "async_timeout>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "pyinstaller>=6.0",
+]
+
+[project.scripts]
+holo = "holo.cli:main"
+
+[project.urls]
+Repository = "https://github.com/nospaceleftondevice/holo"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/holo"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/holo/static/popup.html" = "holo/static/popup.html"
+"src/holo/static/framing.js" = "holo/static/framing.js"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+# `bridge/` runs under SikuliX's bundled Jython 2.7. Linting it under
+# py311 rules would push us toward syntax (f-strings, walrus, type
+# hints) Jython can't parse — so the directory is hand-reviewed
+# instead.
+extend-exclude = ["bridge"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "UP",  # pyupgrade
+  "W",   # pycodestyle warnings
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
