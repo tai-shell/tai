@@ -1,0 +1,292 @@
+/* extract.c — Pull the appended payload out of the binary into a
+   cache dir on first run. Cache layout:
+
+       ~/Library/Caches/tai/
+           payload-<48 hex chars>/      ← cache dir, keyed by trailer
+              .stamp                    ← created last; signals "ready"
+              version
+              runtime/
+              holo/
+              site-packages/
+              sikuli/
+
+   The 48 hex chars come from the trailer's raw bytes — see
+   `cache_key_from_trailer`. A different build (different bash,
+   different bundle contents) produces a different trailer and gets
+   a different cache dir, so upgrades silently provision new caches
+   and old caches stay intact (rollback is a `cp` away). */
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "extract.h"
+
+/* Render the 24-byte trailer as 48 lowercase hex characters into
+   out (which must hold >= 49 bytes including the terminator). */
+static void
+cache_key_from_trailer (const tai_payload_trailer_t *trailer, char *out)
+{
+  const unsigned char *bytes = (const unsigned char *) trailer;
+  static const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < sizeof *trailer; i++)
+    {
+      out[2 * i] = hex[bytes[i] >> 4];
+      out[2 * i + 1] = hex[bytes[i] & 0xF];
+    }
+  out[2 * sizeof *trailer] = '\0';
+}
+
+/* mkdir -p equivalent. Returns 0 on success (or already exists). */
+static int
+mkdir_p (const char *path)
+{
+  char buf[PATH_MAX];
+  strncpy (buf, path, sizeof buf - 1);
+  buf[sizeof buf - 1] = '\0';
+  for (char *p = buf + 1; *p; p++)
+    {
+      if (*p == '/')
+	{
+	  *p = '\0';
+	  if (mkdir (buf, 0755) != 0 && errno != EEXIST)
+	    return -1;
+	  *p = '/';
+	}
+    }
+  if (mkdir (buf, 0755) != 0 && errno != EEXIST)
+    return -1;
+  return 0;
+}
+
+/* Recursively remove a directory tree. Used on extraction failure to
+   not leave a half-populated temp dir behind. Simple shell-out — the
+   number of files is bounded and rm is portable. */
+static void
+rm_rf (const char *path)
+{
+  pid_t pid = fork ();
+  if (pid == 0)
+    {
+      execlp ("rm", "rm", "-rf", path, (char *) NULL);
+      _exit (127);
+    }
+  if (pid > 0)
+    waitpid (pid, NULL, 0);
+}
+
+/* Stream `length` bytes from `src_fd` (already positioned) into the
+   pipe whose write-end is `pipe_w`. Returns 0 on success. */
+static int
+stream_payload_to_pipe (int src_fd, int pipe_w, off_t length)
+{
+  unsigned char buf[64 * 1024];
+  off_t remaining = length;
+  while (remaining > 0)
+    {
+      size_t want = remaining > (off_t) sizeof buf
+		    ? sizeof buf : (size_t) remaining;
+      ssize_t n = read (src_fd, buf, want);
+      if (n <= 0)
+	return -1;
+      ssize_t off = 0;
+      while (off < n)
+	{
+	  ssize_t w = write (pipe_w, buf + off, (size_t) (n - off));
+	  if (w <= 0)
+	    return -1;
+	  off += w;
+	}
+      remaining -= n;
+    }
+  return 0;
+}
+
+/* Spawn `tar -xz -C dest_dir`, return its stdin write-fd in *pipe_w
+   and its pid in *child_pid. The caller writes payload bytes to
+   *pipe_w, then closes it, then waitpid()s on *child_pid. */
+static int
+spawn_tar (const char *dest_dir, int *pipe_w, pid_t *child_pid)
+{
+  int fds[2];
+  if (pipe (fds) != 0)
+    return -1;
+  pid_t pid = fork ();
+  if (pid < 0)
+    {
+      close (fds[0]);
+      close (fds[1]);
+      return -1;
+    }
+  if (pid == 0)
+    {
+      /* child */
+      if (dup2 (fds[0], STDIN_FILENO) < 0)
+	_exit (127);
+      close (fds[0]);
+      close (fds[1]);
+      execlp ("tar", "tar", "-xz", "-C", dest_dir, (char *) NULL);
+      _exit (127);
+    }
+  close (fds[0]);
+  *pipe_w = fds[1];
+  *child_pid = pid;
+  return 0;
+}
+
+int
+tai_payload_ensure_extracted (const char *exe_path,
+			      const tai_payload_trailer_t *trailer,
+			      char *cache_dir_out)
+{
+  /* Compose cache paths. */
+  const char *home = getenv ("HOME");
+  if (home == NULL)
+    {
+      fprintf (stderr, "tai: $HOME is not set; can't locate cache dir\n");
+      return -1;
+    }
+
+  char cache_root[PATH_MAX];
+  snprintf (cache_root, sizeof cache_root,
+	    "%s/Library/Caches/tai", home);
+
+  char key[49];
+  cache_key_from_trailer (trailer, key);
+
+  char cache_dir[PATH_MAX];
+  snprintf (cache_dir, sizeof cache_dir,
+	    "%s/payload-%s", cache_root, key);
+
+  char stamp[PATH_MAX];
+  snprintf (stamp, sizeof stamp, "%s/.stamp", cache_dir);
+
+  /* Fast path: stamp present → already extracted, nothing to do. */
+  struct stat st;
+  if (stat (stamp, &st) == 0)
+    {
+      strncpy (cache_dir_out, cache_dir, PATH_MAX - 1);
+      cache_dir_out[PATH_MAX - 1] = '\0';
+      return 0;
+    }
+
+  /* Slow path: extract into a temp dir, then atomically rename. The
+     pid in the temp-dir name guarantees that two simultaneous first-
+     launches don't trample each other; whichever finishes first wins
+     the rename, the loser cleans up its temp dir. */
+  if (mkdir_p (cache_root) != 0)
+    {
+      fprintf (stderr, "tai: failed to create cache root %s: %s\n",
+	       cache_root, strerror (errno));
+      return -1;
+    }
+
+  char tmp_dir[PATH_MAX];
+  snprintf (tmp_dir, sizeof tmp_dir,
+	    "%s.tmp-%d", cache_dir, (int) getpid ());
+
+  /* Wipe any stale temp from a previous crashed run with the same
+     pid (unlikely but possible). */
+  rm_rf (tmp_dir);
+  if (mkdir (tmp_dir, 0755) != 0)
+    {
+      fprintf (stderr, "tai: mkdir %s failed: %s\n",
+	       tmp_dir, strerror (errno));
+      return -1;
+    }
+
+  fprintf (stderr, "tai: extracting bundled payload to %s\n", cache_dir);
+
+  int src_fd = open (exe_path, O_RDONLY);
+  if (src_fd < 0)
+    {
+      fprintf (stderr, "tai: open(%s): %s\n",
+	       exe_path, strerror (errno));
+      rm_rf (tmp_dir);
+      return -1;
+    }
+  if (lseek (src_fd, (off_t) trailer->offset, SEEK_SET) < 0)
+    {
+      fprintf (stderr, "tai: lseek to payload failed: %s\n",
+	       strerror (errno));
+      close (src_fd);
+      rm_rf (tmp_dir);
+      return -1;
+    }
+
+  int pipe_w;
+  pid_t child;
+  if (spawn_tar (tmp_dir, &pipe_w, &child) != 0)
+    {
+      fprintf (stderr, "tai: failed to spawn tar\n");
+      close (src_fd);
+      rm_rf (tmp_dir);
+      return -1;
+    }
+
+  int rc = stream_payload_to_pipe (src_fd, pipe_w, (off_t) trailer->length);
+  close (pipe_w);
+  close (src_fd);
+
+  int status;
+  if (waitpid (child, &status, 0) < 0)
+    {
+      fprintf (stderr, "tai: waitpid on tar failed: %s\n",
+	       strerror (errno));
+      rm_rf (tmp_dir);
+      return -1;
+    }
+  if (rc != 0 || !WIFEXITED (status) || WEXITSTATUS (status) != 0)
+    {
+      fprintf (stderr, "tai: tar -xz failed (status=%d)\n", status);
+      rm_rf (tmp_dir);
+      return -1;
+    }
+
+  /* Stamp file last — its presence is the "extraction complete"
+     signal. Writing into tmp_dir (which we still own exclusively),
+     then renaming the whole dir, gives atomic readiness from the
+     fast-path's perspective. */
+  char tmp_stamp[PATH_MAX];
+  snprintf (tmp_stamp, sizeof tmp_stamp, "%s/.stamp", tmp_dir);
+  FILE *sf = fopen (tmp_stamp, "w");
+  if (sf == NULL)
+    {
+      fprintf (stderr, "tai: stamp write failed: %s\n", strerror (errno));
+      rm_rf (tmp_dir);
+      return -1;
+    }
+  fprintf (sf, "ready\n");
+  fclose (sf);
+
+  /* Atomic rename to the final cache dir. If a concurrent extractor
+     beat us to it, the rename fails with EEXIST/ENOTEMPTY on macOS
+     because rename(dir, existing_dir) only succeeds if the target
+     is empty; treat that as a benign race and clean up our temp. */
+  if (rename (tmp_dir, cache_dir) != 0)
+    {
+      if (errno == EEXIST || errno == ENOTEMPTY)
+	{
+	  /* Lost the race — peer extractor populated cache_dir. */
+	  rm_rf (tmp_dir);
+	}
+      else
+	{
+	  fprintf (stderr, "tai: rename %s -> %s failed: %s\n",
+		   tmp_dir, cache_dir, strerror (errno));
+	  rm_rf (tmp_dir);
+	  return -1;
+	}
+    }
+
+  strncpy (cache_dir_out, cache_dir, PATH_MAX - 1);
+  cache_dir_out[PATH_MAX - 1] = '\0';
+  return 0;
+}

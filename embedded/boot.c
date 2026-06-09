@@ -13,11 +13,13 @@
 #include <libgen.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "boot.h"
+#include "extract.h"
 #include "payload.h"
 
 /* Locate the directory containing the running binary, resolving any
@@ -68,37 +70,70 @@ tai_resolve_exe_path (char *out)
   return 0;
 }
 
-/* Build a sys.path-setup Python snippet that prepends three paths
-   computed from `exe_dir`. The order matches the precedence rule:
-   vendored holo wins over the runtime package wins over the pip
-   dep closure. Returns a malloc'd string the caller must free.
+/* The five filesystem locations the embedded interpreter needs.
+   Filled from the bundled-payload cache when present, otherwise
+   from the dev-tree layout next to the running binary. */
+typedef struct {
+  char holo_src[PATH_MAX];	/* parent of the `holo` package      */
+  char runtime[PATH_MAX];	/* parent of the `tai_runtime` package*/
+  char site_pkgs[PATH_MAX];	/* pip-installed dep closure          */
+  char sikuli_jar[PATH_MAX];	/* SikuliX jar absolute path          */
+  char bridge_script[PATH_MAX];	/* bridge.py absolute path            */
+} tai_runtime_paths_t;
 
-   We don't quote-escape exe_dir for the embedded Python string
-   literal because realpath() output won't contain quote chars on
-   any plausible filesystem we care about. */
-static char *
-tai_format_path_setup (const char *exe_dir)
+static void
+tai_paths_from_cache_dir (const char *cache_dir,
+			  tai_runtime_paths_t *out)
 {
-  /* Liberal upper bound: 3 path strings (~PATH_MAX each) +
-     boilerplate. PATH_MAX is 1024 on macOS, so ~4 KiB worst case. */
+  snprintf (out->holo_src,      sizeof out->holo_src,
+	    "%s/holo/src",                       cache_dir);
+  snprintf (out->runtime,       sizeof out->runtime,
+	    "%s/runtime",                        cache_dir);
+  snprintf (out->site_pkgs,     sizeof out->site_pkgs,
+	    "%s/site-packages",                  cache_dir);
+  snprintf (out->sikuli_jar,    sizeof out->sikuli_jar,
+	    "%s/sikuli/sikulixide-2.0.5.jar",    cache_dir);
+  snprintf (out->bridge_script, sizeof out->bridge_script,
+	    "%s/holo/bridge/bridge.py",          cache_dir);
+}
+
+static void
+tai_paths_from_dev_tree (const char *exe_dir,
+			 tai_runtime_paths_t *out)
+{
+  snprintf (out->holo_src,      sizeof out->holo_src,
+	    "%s/vendor/holo/src",                exe_dir);
+  snprintf (out->runtime,       sizeof out->runtime,
+	    "%s/embedded/runtime",               exe_dir);
+  snprintf (out->site_pkgs,     sizeof out->site_pkgs,
+	    "%s/build/site-packages",            exe_dir);
+  snprintf (out->sikuli_jar,    sizeof out->sikuli_jar,
+	    "%s/build/sikuli/sikulixide-2.0.5.jar", exe_dir);
+  snprintf (out->bridge_script, sizeof out->bridge_script,
+	    "%s/vendor/holo/bridge/bridge.py",   exe_dir);
+}
+
+/* Build a sys.path-setup Python snippet that prepends three paths
+   from `paths`. The order matches the precedence rule: vendored
+   holo wins over the runtime package wins over the pip dep closure.
+   Returns a malloc'd string the caller must free.
+
+   We don't quote-escape because realpath() / cache-dir paths won't
+   contain quote chars on any plausible filesystem we care about. */
+static char *
+tai_format_path_setup (const tai_runtime_paths_t *paths)
+{
   size_t cap = (PATH_MAX + 64) * 3 + 128;
   char *buf = malloc (cap);
   if (buf == NULL)
     return NULL;
 
-  /* Dev-tree layout (matches `make` output):
-       <exe_dir>/vendor/holo/src         vendored holo
-       <exe_dir>/embedded/runtime        tai_runtime package
-       <exe_dir>/build/site-packages     pip-installed deps
-     For an installed binary, the post-install hook should drop the
-     same three sibling dirs next to the executable, or eventually
-     freeze them into the binary so this lookup becomes a no-op. */
   snprintf (buf, cap,
 	    "import sys\n"
-	    "sys.path.insert(0, '%s/build/site-packages')\n"
-	    "sys.path.insert(0, '%s/embedded/runtime')\n"
-	    "sys.path.insert(0, '%s/vendor/holo/src')\n",
-	    exe_dir, exe_dir, exe_dir);
+	    "sys.path.insert(0, '%s')\n"
+	    "sys.path.insert(0, '%s')\n"
+	    "sys.path.insert(0, '%s')\n",
+	    paths->site_pkgs, paths->runtime, paths->holo_src);
   return buf;
 }
 
@@ -138,63 +173,56 @@ tai_embedded_serve_stdio (void)
      baked in at build time via -D in EMBED_CFLAGS. We prepend it
      to sys.path so `import holo` finds the vendored tree before any
      other site-packages copy. */
-  /* Probe for an appended payload trailer before deciding where to
-     look for the runtime support tree. The bundled binary (produced
-     by `make -C embedded bundle`) has its runtime + vendored holo +
-     site-packages + SikuliX jar appended as a gzip tarball with a
-     24-byte trailer at EOF. A plain dev build has no trailer and
-     this probe is a clean miss — we fall back to the dev-tree
-     path resolution below. */
+  /* Pick the runtime support layout. Bundled binary (produced by
+     `make -C embedded bundle`) has the runtime appended as a gzip
+     tarball with a 24-byte trailer at EOF; we extract once into a
+     per-binary cache dir and point at it. A plain dev build has no
+     trailer and falls back to the sibling-dirs-of-the-binary
+     layout that `make` produces. */
+  tai_runtime_paths_t paths;
+  bool resolved = false;
   char exe_path[PATH_MAX];
   if (tai_resolve_exe_path (exe_path) == 0)
     {
       tai_payload_trailer_t trailer;
       if (tai_payload_read_trailer (exe_path, &trailer) == 0)
 	{
-	  fprintf (stderr,
-		   "tai: bundled payload found (offset=%llu length=%llu)\n",
-		   (unsigned long long) trailer.offset,
-		   (unsigned long long) trailer.length);
-	  /* Extraction + cache wiring lands in Part B of #93. For
-	     now we proceed to the dev-tree path even when bundled —
-	     just so a bundled binary built today still runs, by
-	     virtue of having the dev sibling dirs next to it. */
+	  char cache_dir[PATH_MAX];
+	  if (tai_payload_ensure_extracted (exe_path, &trailer,
+					    cache_dir) == 0)
+	    {
+	      tai_paths_from_cache_dir (cache_dir, &paths);
+	      resolved = true;
+	    }
+	  /* Falls through to dev-tree below if extraction failed; the
+	     caller will see a clearer ModuleNotFoundError there if the
+	     binary is bundled but the dev tree isn't present either. */
 	}
     }
-
-  /* Compute the three sys.path entries from the binary's location at
-     runtime (not from build-time -D macros, so the binary relocates
-     cleanly). Order matters: vendored holo must come BEFORE any
-     site-packages copy so a system-wide pip-installed holo (if any)
-     doesn't shadow our pin. */
-  char exe_dir[PATH_MAX];
-  if (tai_resolve_exe_dir (exe_dir) != 0)
+  if (!resolved)
     {
-      fprintf (stderr, "tai: could not resolve executable path\n");
-      Py_Finalize ();
-      return 70;
+      char exe_dir[PATH_MAX];
+      if (tai_resolve_exe_dir (exe_dir) != 0)
+	{
+	  fprintf (stderr, "tai: could not resolve executable path\n");
+	  Py_Finalize ();
+	  return 70;
+	}
+      tai_paths_from_dev_tree (exe_dir, &paths);
     }
 
   /* Tell holo.bridge where to find the SikuliX jar + Jython bridge
-     script. Both live next to the binary in the dev tree (and in the
-     install tree once the post-install hook lays them out). Setting
-     the env vars from C means a user invoking `tcsh` doesn't need
-     anything in their shell environment for screen_* tools to work.
+     script. Setting the env vars from C means a user invoking
+     `tcsh` doesn't need anything in their shell environment for
+     screen_* tools to work.
 
-     Also point holo.templates at a tai-specific cache dir so a user
-     with both holo and tai installed doesn't get their template
-     stores tangled. Same `overwrite=0` policy as the bridge vars:
-     the user's explicit env wins. */
+     Also point holo.templates at a tai-specific cache dir so a
+     user with both holo and tai installed doesn't get their
+     template stores tangled. overwrite=0: the user's explicit env
+     wins. */
+  setenv ("HOLO_SIKULI_JAR",    paths.sikuli_jar,    /*overwrite=*/0);
+  setenv ("HOLO_BRIDGE_SCRIPT", paths.bridge_script, /*overwrite=*/0);
   {
-    char sikuli_jar[PATH_MAX];
-    char bridge_script[PATH_MAX];
-    snprintf (sikuli_jar, sizeof sikuli_jar,
-	      "%s/build/sikuli/sikulixide-2.0.5.jar", exe_dir);
-    snprintf (bridge_script, sizeof bridge_script,
-	      "%s/vendor/holo/bridge/bridge.py", exe_dir);
-    setenv ("HOLO_SIKULI_JAR", sikuli_jar, /*overwrite=*/0);
-    setenv ("HOLO_BRIDGE_SCRIPT", bridge_script, /*overwrite=*/0);
-
     const char *home = getenv ("HOME");
     if (home != NULL)
       {
@@ -205,7 +233,7 @@ tai_embedded_serve_stdio (void)
       }
   }
 
-  char *path_setup = tai_format_path_setup (exe_dir);
+  char *path_setup = tai_format_path_setup (&paths);
   if (path_setup == NULL)
     {
       fprintf (stderr, "tai: out of memory composing sys.path setup\n");
