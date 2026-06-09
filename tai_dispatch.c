@@ -14,6 +14,7 @@
 #include "shell.h"
 
 #include "tai_dispatch.h"
+#include "embedded/boot.h"
 
 static const char *
 tai_basename (const char *path)
@@ -41,19 +42,9 @@ tai_is_user_shell_name (const char *argv0)
 int
 tai_control_shell_main (int argc, char **argv)
 {
-  /* Stub. The real implementation will:
-       - Py_InitializeEx(0)
-       - import the frozen holo.mcp_server
-       - construct HoloMCPServer(embedded=True)
-       - call serve_stdio() until EOF on stdin
-       - Py_Finalize() and exit with the loop's return code.
-     For now we just announce ourselves on stderr so callers can verify
-     the dispatch is wired up end-to-end, then exit cleanly. Positional
-     args are discarded per design (the name is the whole signal). */
+  /* Positional args are discarded per design (the name is the whole
+     signal). Hand off to the embedded-Python serve loop. */
   (void) argc;
-  fprintf (stderr,
-	   "tai: control shell stub (argv[0]=%s)\n"
-	   "tai: real MCP server is not implemented yet; exiting.\n",
-	   argv[0] ? argv[0] : "(null)");
-  return 0;
+  (void) argv;
+  return tai_embedded_serve_stdio ();
 }
