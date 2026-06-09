@@ -81,3 +81,8 @@ configure.lineno
 
 # Embedded-holo build artifacts (CPython static, freeze output, native cache)
 /build/
+
+# Python bytecode caches from importing embedded/runtime/tai_runtime/.
+# Harmless to ship but pure churn in `git status`.
+__pycache__/
+*.pyc

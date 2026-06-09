@@ -56,28 +56,61 @@ tai_embedded_serve_stdio (void)
 #ifndef TAI_EMBED_SITE_PKGS
 #  error "TAI_EMBED_SITE_PKGS must be -D'd at build time (see Makefile.in)"
 #endif
+#ifndef TAI_EMBED_RUNTIME
+#  error "TAI_EMBED_RUNTIME must be -D'd at build time (see Makefile.in)"
+#endif
+
+  /* Wire sys.path so the tai_runtime package, the dep closure, and the
+     vendored holo tree are all reachable. Order matters: vendored holo
+     must come BEFORE any site-packages copy so a system-wide pip-installed
+     holo (if any) doesn't shadow our pin. */
   if (PyRun_SimpleString (
 	"import sys\n"
 	"sys.path.insert(0, '" TAI_EMBED_SITE_PKGS "')\n"
-	"sys.path.insert(0, '" TAI_VENDOR_HOLO_PATH "')\n"
-	"import holo, holo.browser_chrome\n"
-	"from importlib.metadata import version as _v\n"
-	"from mcp.server.fastmcp import FastMCP\n"
-	"print('tai: embedded Python', sys.version.split()[0], file=sys.stderr)\n"
-	"print('tai: holo', holo.__version__, '+ mcp', _v('mcp'),\n"
-	"      '+ pydantic-core', _v('pydantic-core'),\n"
-	"      'imported; FastMCP:', FastMCP.__name__, file=sys.stderr)\n") != 0)
+	"sys.path.insert(0, '" TAI_EMBED_RUNTIME "')\n"
+	"sys.path.insert(0, '" TAI_VENDOR_HOLO_PATH "')\n") != 0)
     {
-      fprintf (stderr, "tai: embedded holo+mcp import failed\n");
+      fprintf (stderr, "tai: sys.path setup failed\n");
       Py_Finalize ();
       return 70;
+    }
+
+  /* Import tai_runtime.server and call its serve() entry point.
+     Using the C API (rather than PyRun_SimpleString) so the int return
+     value flows back to the caller as a real exit code. */
+  PyObject *server_mod = PyImport_ImportModule ("tai_runtime.server");
+  if (server_mod == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "tai: failed to import tai_runtime.server\n");
+      Py_Finalize ();
+      return 70;
+    }
+
+  PyObject *result = PyObject_CallMethod (server_mod, "serve", NULL);
+  Py_DECREF (server_mod);
+  if (result == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "tai: tai_runtime.server.serve() raised\n");
+      Py_Finalize ();
+      return 70;
+    }
+
+  long exit_code = PyLong_AsLong (result);
+  Py_DECREF (result);
+  if (exit_code == -1 && PyErr_Occurred ())
+    {
+      PyErr_Print ();
+      exit_code = 70;
     }
 
   if (Py_FinalizeEx () < 0)
     {
       fprintf (stderr, "tai: Py_FinalizeEx reported a clean-up error\n");
-      return 70;
+      if (exit_code == 0)
+	exit_code = 70;
     }
 
-  return 0;
+  return (int) exit_code;
 }

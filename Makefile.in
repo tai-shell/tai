@@ -163,7 +163,8 @@ EMBED_CPYTHON_PREFIX = $(srcdir)/build/cpython-install
 # binary location once we have appended-resource layout.
 EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13 \
 	       -DTAI_VENDOR_HOLO_PATH='"$(abspath $(srcdir))/vendor/holo/src"' \
-	       -DTAI_EMBED_SITE_PKGS='"$(abspath $(srcdir))/build/site-packages"'
+	       -DTAI_EMBED_SITE_PKGS='"$(abspath $(srcdir))/build/site-packages"' \
+	       -DTAI_EMBED_RUNTIME='"$(abspath $(srcdir))/embedded/runtime"'
 EMBED_LIBS   = -L$(EMBED_CPYTHON_PREFIX)/lib/python3.13/config-3.13-darwin \
 	       -lpython3.13 -L/usr/local/opt/gettext/lib -lintl -ldl \
 	       -framework CoreFoundation
