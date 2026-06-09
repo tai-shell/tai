@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "boot.h"
+#include "payload.h"
 
 /* Locate the directory containing the running binary, resolving any
    symlinks (so /tmp/tcsh -> /usr/local/bin/tai gives /usr/local/bin).
@@ -47,6 +48,23 @@ tai_resolve_exe_dir (char *out)
 
   strncpy (out, dir, PATH_MAX - 1);
   out[PATH_MAX - 1] = '\0';
+  return 0;
+}
+
+/* Same as tai_resolve_exe_dir but writes the full resolved path of
+   the executable file (not its parent directory). Used by the
+   payload-trailer reader. */
+static int
+tai_resolve_exe_path (char *out)
+{
+  char raw[PATH_MAX];
+  uint32_t size = sizeof raw;
+
+  if (_NSGetExecutablePath (raw, &size) != 0)
+    return -1;
+
+  if (realpath (raw, out) == NULL)
+    return -1;
   return 0;
 }
 
@@ -120,6 +138,30 @@ tai_embedded_serve_stdio (void)
      baked in at build time via -D in EMBED_CFLAGS. We prepend it
      to sys.path so `import holo` finds the vendored tree before any
      other site-packages copy. */
+  /* Probe for an appended payload trailer before deciding where to
+     look for the runtime support tree. The bundled binary (produced
+     by `make -C embedded bundle`) has its runtime + vendored holo +
+     site-packages + SikuliX jar appended as a gzip tarball with a
+     24-byte trailer at EOF. A plain dev build has no trailer and
+     this probe is a clean miss — we fall back to the dev-tree
+     path resolution below. */
+  char exe_path[PATH_MAX];
+  if (tai_resolve_exe_path (exe_path) == 0)
+    {
+      tai_payload_trailer_t trailer;
+      if (tai_payload_read_trailer (exe_path, &trailer) == 0)
+	{
+	  fprintf (stderr,
+		   "tai: bundled payload found (offset=%llu length=%llu)\n",
+		   (unsigned long long) trailer.offset,
+		   (unsigned long long) trailer.length);
+	  /* Extraction + cache wiring lands in Part B of #93. For
+	     now we proceed to the dev-tree path even when bundled —
+	     just so a bundled binary built today still runs, by
+	     virtue of having the dev sibling dirs next to it. */
+	}
+    }
+
   /* Compute the three sys.path entries from the binary's location at
      runtime (not from build-time -D macros, so the binary relocates
      cleanly). Order matters: vendored holo must come BEFORE any

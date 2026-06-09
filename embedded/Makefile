@@ -47,7 +47,8 @@ endif
 # Job count for the CPython build.
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-.PHONY: cpython cpython-clean deps deps-clean sikuli-jar sikuli-clean clean help
+.PHONY: cpython cpython-clean deps deps-clean sikuli-jar sikuli-clean \
+        bundle bundle-clean clean help
 
 help:
 	@echo "Embedded-holo build targets:"
@@ -59,6 +60,9 @@ help:
 	@echo "  sikuli-jar      Download SikuliX jar (~123 MB) into build/sikuli/"
 	@echo "                  (needed for screen_* tools; one-time)"
 	@echo "  sikuli-clean    Remove build/sikuli/ only"
+	@echo "  bundle          Produce build/tai-bundled — the single-file"
+	@echo "                  shippable binary with payload appended"
+	@echo "  bundle-clean    Remove build/bundle/ + build/tai-bundled"
 	@echo "  clean           Remove everything under build/"
 	@echo ""
 	@echo "Flags:"
@@ -158,6 +162,59 @@ $(SIKULI_JAR):
 
 sikuli-clean:
 	rm -rf $(SIKULI_DIR)
+
+# ----- Bundled binary --------------------------------------------------------
+#
+# `bundle' builds a relocatable single-file artifact at build/tai-bundled
+# by appending a payload tarball + 24-byte trailer to a copy of the
+# top-level tai binary (the one that `make' produces at $(TAI_ROOT)/bash).
+#
+# The bundle target deliberately does NOT re-build $(TAI_ROOT)/bash —
+# the top-level Makefile owns that and bash's autoconf-driven build is
+# not something we want to invoke recursively here. Build order:
+#   1. `make -C embedded cpython deps sikuli-jar`     (one-time)
+#   2. `make` at the repo root                         (per source edit)
+#   3. `make -C embedded bundle`                       (when shipping)
+TAI_INPUT_BIN  := $(TAI_ROOT)/bash
+TAI_OUTPUT_BIN := $(BUILD_DIR)/tai-bundled
+BUNDLE_STAGE   := $(BUILD_DIR)/bundle
+
+# Files that, when changed, force a re-bundle. Doesn't need to be
+# perfect — bundle re-runs are cheap.
+BUNDLE_DEPS = \
+    $(TAI_INPUT_BIN) \
+    $(SITE_PKGS)/.stamp \
+    $(SIKULI_JAR) \
+    $(wildcard $(TAI_ROOT)/embedded/runtime/tai_runtime/*.py) \
+    $(wildcard $(TAI_ROOT)/vendor/holo/src/holo/*.py) \
+    $(wildcard $(TAI_ROOT)/vendor/holo/bridge/*.py)
+
+bundle: $(TAI_OUTPUT_BIN)
+
+$(TAI_OUTPUT_BIN): $(BUNDLE_DEPS) $(TAI_ROOT)/embedded/mkbundle.sh
+	@if [ ! -f $(TAI_INPUT_BIN) ]; then \
+	    echo "ERROR: $(TAI_INPUT_BIN) doesn't exist"; \
+	    echo "  run \`make\` at the repo root first"; \
+	    exit 1; \
+	fi
+	@echo "==> Staging payload tree at $(BUNDLE_STAGE)"
+	@rm -rf $(BUNDLE_STAGE)
+	@mkdir -p $(BUNDLE_STAGE)
+	@printf '1\n' > $(BUNDLE_STAGE)/version
+	@cp -R $(TAI_ROOT)/embedded/runtime $(BUNDLE_STAGE)/runtime
+	@mkdir -p $(BUNDLE_STAGE)/holo
+	@cp -R $(TAI_ROOT)/vendor/holo/src $(BUNDLE_STAGE)/holo/src
+	@cp -R $(TAI_ROOT)/vendor/holo/bridge $(BUNDLE_STAGE)/holo/bridge
+	@cp -R $(SITE_PKGS) $(BUNDLE_STAGE)/site-packages
+	@mkdir -p $(BUNDLE_STAGE)/sikuli
+	@cp $(SIKULI_JAR) $(BUNDLE_STAGE)/sikuli/
+	@find $(BUNDLE_STAGE) -name __pycache__ -type d -exec rm -rf {} +
+	@find $(BUNDLE_STAGE) -name '*.pyc' -delete
+	$(TAI_ROOT)/embedded/mkbundle.sh \
+	    $(TAI_INPUT_BIN) $(TAI_OUTPUT_BIN) $(BUNDLE_STAGE)
+
+bundle-clean:
+	rm -rf $(BUNDLE_STAGE) $(TAI_OUTPUT_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)

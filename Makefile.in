@@ -551,7 +551,7 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
 	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O) \
-	   agent_dispatch.o tai_dispatch.o embedded/boot.o
+	   agent_dispatch.o tai_dispatch.o embedded/boot.o embedded/payload.o
 
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
@@ -658,9 +658,15 @@ $(Program): $(OBJECTS) $(BUILTINS_DEP) $(LIBDEP) .build
 # Per-file rule for the embedded-Python boot: needs Python.h on the
 # include path. Done as an explicit rule so we don't add Python's
 # include dir to every translation unit's CFLAGS.
-embedded/boot.o: $(srcdir)/embedded/boot.c $(srcdir)/embedded/boot.h
+embedded/boot.o: $(srcdir)/embedded/boot.c $(srcdir)/embedded/boot.h $(srcdir)/embedded/payload.h
 	@mkdir -p embedded
 	$(CC) -c $(CCFLAGS) $(EMBED_CFLAGS) -o $@ $(srcdir)/embedded/boot.c
+
+# Per-file rule for the payload trailer reader. Plain C — no Python
+# headers needed — so it links cleanly into a non-bundled binary too.
+embedded/payload.o: $(srcdir)/embedded/payload.c $(srcdir)/embedded/payload.h
+	@mkdir -p embedded
+	$(CC) -c $(CCFLAGS) -o $@ $(srcdir)/embedded/payload.c
 
 .build:	$(SOURCES) config.h Makefile $(DEFDIR)/builtext.h version.h $(VERSPROG)
 	@echo
