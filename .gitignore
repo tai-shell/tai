@@ -78,3 +78,6 @@ configure.lineno
 
 # Out-of-tree build directories used by Makefile.tai (linux, etc.)
 /build-*/
+
+# Embedded-holo build artifacts (CPython static, freeze output, native cache)
+/build/
