@@ -70,6 +70,8 @@ extern int get_tty_state (void);
 #include "execute_cmd.h"
 #include "findcmd.h"
 
+#include "tai_dispatch.h"
+
 #if defined (USING_BASH_MALLOC) && defined (DEBUG) && !defined (DISABLE_MALLOC_WRAPPERS)
 #  include <malloc/shmalloc.h>
 #elif defined (MALLOC_DEBUG) && defined (USING_BASH_MALLOC)
@@ -374,6 +376,12 @@ int
 main (int argc, char **argv, char **env)
 #endif /* !NO_MAIN_ENV_ARG */
 {
+  /* tai argv[0] dispatch — runs before any bash initialization so the
+     control shell never sets up signal handlers, terminal modes, or
+     job-control state that bash assumes. See docs/embedded-holo.md. */
+  if (argc > 0 && tai_is_control_shell_name (argv[0]))
+    return tai_control_shell_main (argc, argv);
+
   register int i;
   int code, old_errexit_flag;
 #if defined (RESTRICTED_SHELL)
