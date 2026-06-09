@@ -137,7 +137,12 @@ tai_embedded_serve_stdio (void)
      script. Both live next to the binary in the dev tree (and in the
      install tree once the post-install hook lays them out). Setting
      the env vars from C means a user invoking `tcsh` doesn't need
-     anything in their shell environment for screen_* tools to work. */
+     anything in their shell environment for screen_* tools to work.
+
+     Also point holo.templates at a tai-specific cache dir so a user
+     with both holo and tai installed doesn't get their template
+     stores tangled. Same `overwrite=0` policy as the bridge vars:
+     the user's explicit env wins. */
   {
     char sikuli_jar[PATH_MAX];
     char bridge_script[PATH_MAX];
@@ -147,6 +152,15 @@ tai_embedded_serve_stdio (void)
 	      "%s/vendor/holo/bridge/bridge.py", exe_dir);
     setenv ("HOLO_SIKULI_JAR", sikuli_jar, /*overwrite=*/0);
     setenv ("HOLO_BRIDGE_SCRIPT", bridge_script, /*overwrite=*/0);
+
+    const char *home = getenv ("HOME");
+    if (home != NULL)
+      {
+	char tmpl_dir[PATH_MAX];
+	snprintf (tmpl_dir, sizeof tmpl_dir,
+		  "%s/Library/Caches/tai/templates", home);
+	setenv ("HOLO_TEMPLATE_DIR", tmpl_dir, /*overwrite=*/0);
+      }
   }
 
   char *path_setup = tai_format_path_setup (exe_dir);

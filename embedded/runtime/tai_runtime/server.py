@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 from holo import browser_chrome
 from holo.bridge import BridgeClient
+from holo.templates import TemplateNotFound, TemplateStore
 
 
 _app = FastMCP("tai-control-shell")
@@ -30,6 +31,7 @@ _app = FastMCP("tai-control-shell")
 # ---------------------------------------------------------------------------
 
 _bridge: BridgeClient | None = None
+_templates: TemplateStore | None = None
 
 
 def _get_bridge() -> BridgeClient:
@@ -39,6 +41,15 @@ def _get_bridge() -> BridgeClient:
         _bridge.start()
         atexit.register(_bridge.stop)
     return _bridge
+
+
+def _get_templates() -> TemplateStore:
+    """Lazy template store. Root path comes from HOLO_TEMPLATE_DIR
+    which embedded/boot.c sets to ~/Library/Caches/tai/templates."""
+    global _templates
+    if _templates is None:
+        _templates = TemplateStore()
+    return _templates
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +213,152 @@ def screen_user_capture(
     return _get_bridge().user_capture(prompt=prompt, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# ui_template_* tools — persistent name → PNG cache for stable UI elements.
+#
+# Bodies are full-fidelity ports of HoloMCPServer.ui_template_* (vendor/holo/
+# src/holo/mcp_server.py lines 493-610) with `self.templates` and
+# `self._capture_target() / _input_target()` rewritten to call our lazy
+# accessors. Tool docstrings and parameter defaults match holo verbatim so
+# agents trained against standalone holo work against tai with no prompt
+# changes.
+# ---------------------------------------------------------------------------
+
+
+@_app.tool(
+    description=(
+        "Save a template image for `(app, label)`. If `region` is "
+        "provided, captures that screen rect; otherwise blocks for the "
+        "user to drag-select a rectangle (Esc cancels). `app` defaults "
+        "to '_global'. Pass `replace=True` to discard existing variants; "
+        "otherwise the new image is added as another variant (idle, "
+        "hover, dark mode, etc.). Returns the saved index entry, or "
+        "{cancelled: true} if the user pressed Esc."
+    )
+)
+def ui_template_capture(
+    label: str,
+    app: str | None = None,
+    region: dict[str, int] | None = None,
+    replace: bool = False,
+    similarity: float = 0.85,
+    timeout: float = 60.0,
+    prompt: str = "",
+) -> dict[str, Any]:
+    capture = _get_bridge()
+    if region is not None:
+        png = capture.screenshot(region=region)
+    else:
+        result = capture.user_capture(prompt=prompt, timeout=timeout)
+        if result.get("cancelled"):
+            return {
+                "cancelled": True,
+                "reason": result.get("reason", "user cancelled"),
+            }
+        png = base64.b64decode(result["image"])
+    entry = _get_templates().add_variant(
+        label, app, png, replace=replace, similarity=similarity
+    )
+    return {"saved": True, "entry": entry}
+
+
+@_app.tool(
+    description=(
+        "List stored UI templates. `app=None` lists everything; pass an "
+        "app name (or '_global') to filter."
+    )
+)
+def ui_template_list(app: str | None = None) -> dict[str, Any]:
+    return {"templates": _get_templates().list(app=app)}
+
+
+@_app.tool(
+    description=(
+        "Locate a saved template on the current screen. Walks variants "
+        "in order, returns the first hit as {x, y, width, height, score, "
+        "variant} or null if none match. Raises if the label has no "
+        "registered template — call `ui_template_capture` first."
+    )
+)
+def ui_template_find(
+    label: str,
+    app: str | None = None,
+    region: dict[str, int] | None = None,
+) -> dict[str, Any] | None:
+    store = _get_templates()
+    try:
+        paths = store.variant_paths(label, app)
+    except TemplateNotFound as e:
+        raise LookupError(str(e)) from e
+    entry = store.get(label, app)
+    # `get` is checked because `variant_paths` would have raised already
+    # if the entry was missing; this is just an annotation for type
+    # narrowing.
+    score = float(entry["similarity"]) if entry else 0.85
+    capture = _get_bridge()
+    for p in paths:
+        match = capture.find_image_path(str(p), region=region, score=score)
+        if match is not None:
+            store.touch(label, app)
+            return {**match, "variant": p.name}
+    return None
+
+
+@_app.tool(
+    description=(
+        "Find a saved template and click its center. Raises if nothing "
+        "matches — clicking the wrong place is worse than a clear error."
+    )
+)
+def ui_template_click(
+    label: str,
+    app: str | None = None,
+    region: dict[str, int] | None = None,
+    button: str = "left",
+    clicks: int = 1,
+) -> dict[str, Any]:
+    del button, clicks  # not yet wired through screen.click — left/single only
+    match = ui_template_find(label, app, region=region)
+    if match is None:
+        app_norm = app or "_global"
+        raise RuntimeError(
+            f"template {app_norm}/{label} matched nothing on screen "
+            "(use ui_template_capture to refresh, or check whether the "
+            "target app is in front)"
+        )
+    cx = int(match["x"] + match["width"] / 2)
+    cy = int(match["y"] + match["height"] / 2)
+    _get_bridge().click(cx, cy)
+    return {
+        "clicked": True,
+        "x": cx,
+        "y": cy,
+        "score": match["score"],
+        "variant": match["variant"],
+    }
+
+
+@_app.tool(
+    description=(
+        "Remove a stored template entry, or pass `variant` to delete just "
+        "one variant (the entry stays if other variants remain)."
+    )
+)
+def ui_template_delete(
+    label: str,
+    app: str | None = None,
+    variant: str | None = None,
+) -> dict[str, Any]:
+    removed = _get_templates().delete(label, app, variant=variant)
+    return {"removed": removed}
+
+
 def serve() -> int:
     """Enter the MCP stdio serve loop. Returns when stdin EOFs."""
     tools = _app._tool_manager.list_tools()
     print(f"tai: control shell serving MCP over stdio "
-          f"({len(tools)} tools: browser_*, screen_*, app_activate)",
-          file=sys.stderr, flush=True)
+          f"({len(tools)} tools: browser_*, screen_*, ui_template_*, "
+          "app_activate)", file=sys.stderr, flush=True)
     try:
         _app.run(transport="stdio")
     except (KeyboardInterrupt, BrokenPipeError):
