@@ -41,15 +41,29 @@ tai_embedded_serve_stdio (void)
       return 70;	/* EX_SOFTWARE */
     }
 
-  /* Smoke test: prove the interpreter is up, version is sane, and
-     stderr passthrough works. Goes to stderr so it doesn't pollute
-     stdout (which will carry MCP frames once we have a real server). */
+  /* Smoke test: prove the interpreter is up, vendored holo is
+     importable from sys.path, and the pure-Python browser_chrome
+     module loads without pyobjc. Goes to stderr so stdout stays
+     clean for the eventual MCP frame stream.
+
+     TAI_VENDOR_HOLO_PATH is the absolute path to vendor/holo/src/,
+     baked in at build time via -D in EMBED_CFLAGS. We prepend it
+     to sys.path so `import holo` finds the vendored tree before any
+     other site-packages copy. */
+#ifndef TAI_VENDOR_HOLO_PATH
+#  error "TAI_VENDOR_HOLO_PATH must be -D'd at build time (see Makefile.in)"
+#endif
   if (PyRun_SimpleString (
 	"import sys\n"
-	"print('tai: embedded Python', sys.version.split()[0], "
-	"'is up (smoke test, no MCP yet)', file=sys.stderr)\n") != 0)
+	"sys.path.insert(0, '" TAI_VENDOR_HOLO_PATH "')\n"
+	"import holo, holo.browser_chrome\n"
+	"print('tai: embedded Python', sys.version.split()[0],\n"
+	"      'imported holo', holo.__version__,\n"
+	"      'with browser_chrome.', len([f for f in dir(holo.browser_chrome)\n"
+	"          if not f.startswith('_')]), 'public names',\n"
+	"      file=sys.stderr)\n") != 0)
     {
-      fprintf (stderr, "tai: embedded Python smoke test failed\n");
+      fprintf (stderr, "tai: embedded holo import failed\n");
       Py_Finalize ();
       return 70;
     }

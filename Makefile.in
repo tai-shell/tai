@@ -154,7 +154,12 @@ LIBS_FOR_BUILD =
 # and into the final link of $(Program). Run the CPython build before
 # `make` if you haven't yet; see docs/embedded-holo.md for the flow.
 EMBED_CPYTHON_PREFIX = $(srcdir)/build/cpython-install
-EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13
+# TAI_VENDOR_HOLO_PATH is baked into boot.c so the embedded interpreter
+# can find vendor/holo/src on sys.path at startup. Absolute path so the
+# binary works regardless of cwd. Replaced at "ship time" by a path
+# relative to the binary location once we have appended-resource layout.
+EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13 \
+	       -DTAI_VENDOR_HOLO_PATH='"$(abspath $(srcdir))/vendor/holo/src"'
 EMBED_LIBS   = -L$(EMBED_CPYTHON_PREFIX)/lib/python3.13/config-3.13-darwin \
 	       -lpython3.13 -L/usr/local/opt/gettext/lib -lintl -ldl \
 	       -framework CoreFoundation
