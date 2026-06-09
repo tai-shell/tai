@@ -10,6 +10,16 @@ CPYTHON_SRC   := $(TAI_ROOT)/third_party/cpython
 CPYTHON_BUILD := $(BUILD_DIR)/cpython-build
 CPYTHON_PFX   := $(BUILD_DIR)/cpython-install
 SITE_PKGS     := $(BUILD_DIR)/site-packages
+SIKULI_DIR    := $(BUILD_DIR)/sikuli
+
+# SikuliX jar — pinned from vendor/holo/src/holo/bridge.py. Bump in
+# lockstep with the vendored holo subtree pin in vendor/holo. boot.c
+# points HOLO_SIKULI_JAR at the cached file at runtime so the bridge
+# subprocess can locate it without an env-var dance from the user.
+SIKULI_JAR_NAME := sikulixide-2.0.5.jar
+SIKULI_JAR_URL  := https://github.com/nospaceleftondevice/holo/releases/download/vendored-sikulix-2.0.5/$(SIKULI_JAR_NAME)
+SIKULI_JAR_SHA  := f4b0b50c8e413094e78cd1d8fed02ae65f62f8c53ed00da0562fdedf4acff729
+SIKULI_JAR      := $(SIKULI_DIR)/$(SIKULI_JAR_NAME)
 
 # Python 3.13 used for `pip install --target` into SITE_PKGS. Must be
 # 3.13.x to produce wheels with the same ABI as our embedded CPython.
@@ -37,7 +47,7 @@ endif
 # Job count for the CPython build.
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-.PHONY: cpython cpython-clean deps deps-clean clean help
+.PHONY: cpython cpython-clean deps deps-clean sikuli-jar sikuli-clean clean help
 
 help:
 	@echo "Embedded-holo build targets:"
@@ -46,6 +56,9 @@ help:
 	@echo "  deps            Install holo's pure-Python + Rust-extension deps"
 	@echo "                  into build/site-packages/ for embedding"
 	@echo "  deps-clean      Remove build/site-packages/ only"
+	@echo "  sikuli-jar      Download SikuliX jar (~123 MB) into build/sikuli/"
+	@echo "                  (needed for screen_* tools; one-time)"
+	@echo "  sikuli-clean    Remove build/sikuli/ only"
 	@echo "  clean           Remove everything under build/"
 	@echo ""
 	@echo "Flags:"
@@ -87,13 +100,18 @@ cpython-clean:
 	rm -rf $(CPYTHON_BUILD) $(CPYTHON_PFX)
 
 # What the embedded interpreter needs to import the holo MCP server.
-# Kept minimal — `mcp` brings in the FastMCP framework + its
-# transitive closure (pydantic, anyio, httpx, …). pyobjc is NOT
-# listed here; that's the appended-resource (cache-extract) path.
+# `mcp` brings in the FastMCP framework + its transitive closure
+# (pydantic, anyio, httpx, …). pyobjc-framework-* powers the
+# AppleScript app-activation path and holo._macos pixel-capture
+# helpers. SikuliX itself ships as a jar (see `sikuli-jar` target),
+# not as Python.
 EMBED_DEPS = \
     mcp \
     websockets \
-    pyperclip
+    pyperclip \
+    pyobjc-framework-Quartz \
+    pyobjc-framework-Vision \
+    pyobjc-framework-Cocoa
 
 deps: $(SITE_PKGS)/.stamp
 
@@ -112,6 +130,34 @@ $(SITE_PKGS)/.stamp:
 
 deps-clean:
 	rm -rf $(SITE_PKGS)
+
+# SikuliX jar — large (123 MB), versioned, sha256-verified. Downloaded
+# once into build/sikuli/ and reused for every screen tool call. boot.c
+# sets HOLO_SIKULI_JAR=$(SIKULI_JAR) so the bridge subprocess locates it
+# without user intervention.
+sikuli-jar: $(SIKULI_JAR)
+
+$(SIKULI_JAR):
+	@mkdir -p $(SIKULI_DIR)
+	@if command -v curl >/dev/null 2>&1; then \
+	    echo "==> Downloading $(SIKULI_JAR_NAME) (~123 MB)"; \
+	    curl -fL --progress-bar -o $@.partial $(SIKULI_JAR_URL); \
+	else \
+	    echo "ERROR: curl not found"; exit 1; \
+	fi
+	@echo "==> Verifying SHA-256"
+	@actual=$$(shasum -a 256 $@.partial | cut -d' ' -f1); \
+	if [ "$$actual" != "$(SIKULI_JAR_SHA)" ]; then \
+	    echo "ERROR: sha256 mismatch on $(SIKULI_JAR_NAME)"; \
+	    echo "  expected: $(SIKULI_JAR_SHA)"; \
+	    echo "  got:      $$actual"; \
+	    rm -f $@.partial; exit 1; \
+	fi
+	@mv $@.partial $@
+	@echo "==> $@ ($$(du -h $@ | cut -f1))"
+
+sikuli-clean:
+	rm -rf $(SIKULI_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR)

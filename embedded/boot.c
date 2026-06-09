@@ -133,6 +133,22 @@ tai_embedded_serve_stdio (void)
       return 70;
     }
 
+  /* Tell holo.bridge where to find the SikuliX jar + Jython bridge
+     script. Both live next to the binary in the dev tree (and in the
+     install tree once the post-install hook lays them out). Setting
+     the env vars from C means a user invoking `tcsh` doesn't need
+     anything in their shell environment for screen_* tools to work. */
+  {
+    char sikuli_jar[PATH_MAX];
+    char bridge_script[PATH_MAX];
+    snprintf (sikuli_jar, sizeof sikuli_jar,
+	      "%s/build/sikuli/sikulixide-2.0.5.jar", exe_dir);
+    snprintf (bridge_script, sizeof bridge_script,
+	      "%s/vendor/holo/bridge/bridge.py", exe_dir);
+    setenv ("HOLO_SIKULI_JAR", sikuli_jar, /*overwrite=*/0);
+    setenv ("HOLO_BRIDGE_SCRIPT", bridge_script, /*overwrite=*/0);
+  }
+
   char *path_setup = tai_format_path_setup (exe_dir);
   if (path_setup == NULL)
     {
