@@ -137,8 +137,24 @@ tai_format_path_setup (const tai_runtime_paths_t *paths)
   return buf;
 }
 
-int
-tai_embedded_serve_stdio (void)
+/* Idempotency guard. Once a successful init has happened in this
+   process, subsequent calls to tai_embedded_ensure_ready() are
+   O(1) no-ops. */
+static bool _py_ready = false;
+
+static void
+_tai_finalize_atexit (void)
+{
+  /* Drives Python's own atexit handlers (which include
+     tai_runtime.server's bridge.stop), then tears down the
+     interpreter. Fires on normal exit; SIGKILL bypasses it but
+     the SikuliX bridge has its own parent-death watchdog. */
+  if (_py_ready)
+    Py_FinalizeEx ();
+}
+
+static int
+_tai_embedded_init (void)
 {
   PyStatus status;
   PyConfig config;
@@ -148,7 +164,7 @@ tai_embedded_serve_stdio (void)
   /* Isolated config defaults:
        - no sys.path manipulation from environment
        - no user site-packages
-       - no SIGINT handler installation (tai owns signals)
+       - no SIGINT handler installation (bash owns signals)
      But we DO want stdio to be unbuffered so MCP framing works
      line-by-line without extra fflush() dances. */
   config.buffered_stdio = 0;
@@ -161,18 +177,9 @@ tai_embedded_serve_stdio (void)
     {
       fprintf (stderr, "tai: Py_InitializeFromConfig failed: %s\n",
 	       status.err_msg ? status.err_msg : "(no detail)");
-      return 70;	/* EX_SOFTWARE */
+      return -1;
     }
 
-  /* Smoke test: prove the interpreter is up, vendored holo is
-     importable from sys.path, and the pure-Python browser_chrome
-     module loads without pyobjc. Goes to stderr so stdout stays
-     clean for the eventual MCP frame stream.
-
-     TAI_VENDOR_HOLO_PATH is the absolute path to vendor/holo/src/,
-     baked in at build time via -D in EMBED_CFLAGS. We prepend it
-     to sys.path so `import holo` finds the vendored tree before any
-     other site-packages copy. */
   /* Pick the runtime support layout. Bundled binary (produced by
      `make -C embedded bundle`) has the runtime appended as a gzip
      tarball with a 24-byte trailer at EOF; we extract once into a
@@ -205,21 +212,17 @@ tai_embedded_serve_stdio (void)
       if (tai_resolve_exe_dir (exe_dir) != 0)
 	{
 	  fprintf (stderr, "tai: could not resolve executable path\n");
-	  Py_Finalize ();
-	  return 70;
+	  Py_FinalizeEx ();
+	  return -1;
 	}
       tai_paths_from_dev_tree (exe_dir, &paths);
     }
 
   /* Tell holo.bridge where to find the SikuliX jar + Jython bridge
-     script. Setting the env vars from C means a user invoking
-     `tcsh` doesn't need anything in their shell environment for
-     screen_* tools to work.
-
-     Also point holo.templates at a tai-specific cache dir so a
-     user with both holo and tai installed doesn't get their
-     template stores tangled. overwrite=0: the user's explicit env
-     wins. */
+     script, and holo.templates where its on-disk cache lives.
+     Setting the env vars from C means a user invoking the binary
+     doesn't need anything in their shell environment for screen_*
+     tools to work. overwrite=0: the user's explicit env wins. */
   setenv ("HOLO_SIKULI_JAR",    paths.sikuli_jar,    /*overwrite=*/0);
   setenv ("HOLO_BRIDGE_SCRIPT", paths.bridge_script, /*overwrite=*/0);
   {
@@ -237,17 +240,36 @@ tai_embedded_serve_stdio (void)
   if (path_setup == NULL)
     {
       fprintf (stderr, "tai: out of memory composing sys.path setup\n");
-      Py_Finalize ();
-      return 70;
+      Py_FinalizeEx ();
+      return -1;
     }
   int path_rc = PyRun_SimpleString (path_setup);
   free (path_setup);
   if (path_rc != 0)
     {
       fprintf (stderr, "tai: sys.path setup failed\n");
-      Py_Finalize ();
-      return 70;
+      Py_FinalizeEx ();
+      return -1;
     }
+
+  _py_ready = true;
+  atexit (_tai_finalize_atexit);
+  return 0;
+}
+
+int
+tai_embedded_ensure_ready (void)
+{
+  if (_py_ready)
+    return 0;
+  return _tai_embedded_init ();
+}
+
+int
+tai_embedded_serve_stdio (void)
+{
+  if (tai_embedded_ensure_ready () != 0)
+    return 70;	/* EX_SOFTWARE — diagnostic already on stderr */
 
   /* Import tai_runtime.server and call its serve() entry point.
      Using the C API (rather than PyRun_SimpleString) so the int return
@@ -257,7 +279,6 @@ tai_embedded_serve_stdio (void)
     {
       PyErr_Print ();
       fprintf (stderr, "tai: failed to import tai_runtime.server\n");
-      Py_Finalize ();
       return 70;
     }
 
@@ -267,7 +288,6 @@ tai_embedded_serve_stdio (void)
     {
       PyErr_Print ();
       fprintf (stderr, "tai: tai_runtime.server.serve() raised\n");
-      Py_Finalize ();
       return 70;
     }
 
@@ -277,13 +297,6 @@ tai_embedded_serve_stdio (void)
     {
       PyErr_Print ();
       exit_code = 70;
-    }
-
-  if (Py_FinalizeEx () < 0)
-    {
-      fprintf (stderr, "tai: Py_FinalizeEx reported a clean-up error\n");
-      if (exit_code == 0)
-	exit_code = 70;
     }
 
   return (int) exit_code;

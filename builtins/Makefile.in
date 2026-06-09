@@ -152,7 +152,12 @@ DEFSRC =  $(srcdir)/alias.def $(srcdir)/bind.def $(srcdir)/break.def \
 	  $(srcdir)/times.def $(srcdir)/trap.def $(srcdir)/type.def \
 	  $(srcdir)/ulimit.def $(srcdir)/umask.def $(srcdir)/wait.def \
 	  $(srcdir)/reserved.def $(srcdir)/pushd.def $(srcdir)/shopt.def \
-	  $(srcdir)/printf.def $(srcdir)/complete.def $(srcdir)/mapfile.def
+	  $(srcdir)/printf.def $(srcdir)/complete.def $(srcdir)/mapfile.def \
+	  $(srcdir)/holo.def
+
+# Python include path for the holo builtin (embedded Python C API).
+# Mirrors EMBED_CFLAGS in the top-level Makefile.in.
+EMBED_CPYTHON_INCLUDE = -I${topdir}/build/cpython-install/include/python3.13
 
 STATIC_SOURCE = common.c evalstring.c evalfile.c getopt.c bashgetopt.c \
 		getopt.h 
@@ -164,7 +169,8 @@ OFILES = builtins.o \
 	jobs.o kill.o let.o mapfile.o \
 	pushd.o read.o return.o set.o setattr.o shift.o source.o \
 	suspend.o test.o times.o trap.o type.o ulimit.o umask.o \
-	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o
+	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o \
+	holo.o
 
 CREATED_FILES = builtext.h builtins.c psize.aux pipesize.h tmpbuiltins.c \
 	tmpbuiltins.h
@@ -333,6 +339,15 @@ wait.o: wait.def
 getopts.o: getopts.def
 reserved.o: reserved.def
 complete.o: complete.def
+holo.o: holo.def
+
+# Explicit compile rule for the holo builtin: needs Python.h on the
+# include path. Pure-bash builtins don't, so don't pollute the
+# default .c.o rule. Mirrors embedded/boot.o in the top-level
+# Makefile.in.
+holo.o: holo.c
+	$(RM) $@
+	$(CC) -c $(CCFLAGS) $(EMBED_CPYTHON_INCLUDE) holo.c
 
 # C files
 bashgetopt.o: ../config.h $(topdir)/bashansi.h $(BASHINCDIR)/ansi_stdlib.h

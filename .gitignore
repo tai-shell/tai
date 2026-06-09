@@ -54,6 +54,10 @@ configure.lineno
 /builtins/mkbuiltins
 /builtins/pipesize.h
 /builtins/psize.aux
+# Per-builtin C sources generated from .def files by mkbuiltins. The
+# only tai-specific one (holo.c) is regenerated on every build, but
+# git status would surface it as untracked without an ignore line.
+/builtins/holo.c
 /lib/sh/mksignames
 /lib/sh/mksyntax
 

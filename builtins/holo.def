@@ -1,0 +1,127 @@
+This file is holo.def, from which is created holo.c.
+It implements the builtin "holo" in tai — the embedded-holo dispatch
+surface available when the binary is invoked as `tai` or `tcsh`.
+
+See docs/embedded-holo.md.
+
+$PRODUCES holo.c
+
+#include <config.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+#include "../bashansi.h"
+#include "../shell.h"
+#include "common.h"
+
+#include "../embedded/boot.h"
+
+$BUILTIN holo
+$FUNCTION holo_builtin
+$SHORT_DOC holo TOOL [ARGS...]
+Invoke an embedded-holo tool (browser_*, screen_*, ui_template_*, app_activate).
+
+Examples:
+  holo browser_navigate https://example.com
+  url=$(holo browser_read_active_url)
+  holo screen_click 480 320
+
+The first call brings up the embedded Python interpreter (~80 ms);
+subsequent calls reuse it. See `holo list` for the available tools.
+
+Exit Status:
+  0 on success, 1 on tool error, 2 on usage error (unknown tool,
+  wrong arity, bad argument type).
+$END
+
+static int
+holo_invoke_dispatch (const char *tool, char **argv, int argc)
+{
+  PyObject *shell_mod = PyImport_ImportModule ("tai_runtime.shell");
+  if (shell_mod == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "holo: failed to import tai_runtime.shell\n");
+      return EXECUTION_FAILURE;
+    }
+
+  /* Build a Python list of the remaining args. */
+  PyObject *args_list = PyList_New ((Py_ssize_t) argc);
+  if (args_list == NULL)
+    {
+      Py_DECREF (shell_mod);
+      PyErr_Print ();
+      return EXECUTION_FAILURE;
+    }
+  for (int i = 0; i < argc; i++)
+    {
+      PyObject *item = PyUnicode_FromString (argv[i]);
+      if (item == NULL)
+	{
+	  Py_DECREF (args_list);
+	  Py_DECREF (shell_mod);
+	  PyErr_Print ();
+	  return EXECUTION_FAILURE;
+	}
+      PyList_SET_ITEM (args_list, (Py_ssize_t) i, item); /* steals ref */
+    }
+
+  PyObject *result = PyObject_CallMethod (
+      shell_mod, "dispatch", "(sO)", tool, args_list);
+  Py_DECREF (args_list);
+  Py_DECREF (shell_mod);
+
+  if (result == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "holo: tai_runtime.shell.dispatch() raised\n");
+      return EXECUTION_FAILURE;
+    }
+
+  long rc = PyLong_AsLong (result);
+  Py_DECREF (result);
+  if (rc == -1 && PyErr_Occurred ())
+    {
+      PyErr_Print ();
+      return EXECUTION_FAILURE;
+    }
+  /* dispatch returns 0/1/2; map directly to shell exit codes. */
+  return (int) rc;
+}
+
+int
+holo_builtin (WORD_LIST *list)
+{
+  if (list == NULL)
+    {
+      builtin_usage ();
+      return EX_USAGE;
+    }
+
+  /* Walk the word list into a C argv. First word is the tool name. */
+  int count = 0;
+  for (WORD_LIST *w = list; w; w = w->next)
+    count++;
+
+  char **words = (char **) xmalloc (sizeof (char *) * count);
+  int i = 0;
+  for (WORD_LIST *w = list; w; w = w->next)
+    words[i++] = w->word->word;
+
+  /* Bring the embedded interpreter up if it isn't already. ~80 ms
+     on first call, ~0 ms thereafter. */
+  if (tai_embedded_ensure_ready () != 0)
+    {
+      free (words);
+      return EXECUTION_FAILURE;
+    }
+
+  const char *tool = words[0];
+  int rc = holo_invoke_dispatch (tool, words + 1, count - 1);
+  free (words);
+  return rc;
+}
