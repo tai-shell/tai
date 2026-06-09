@@ -155,11 +155,15 @@ LIBS_FOR_BUILD =
 # `make` if you haven't yet; see docs/embedded-holo.md for the flow.
 EMBED_CPYTHON_PREFIX = $(srcdir)/build/cpython-install
 # TAI_VENDOR_HOLO_PATH is baked into boot.c so the embedded interpreter
-# can find vendor/holo/src on sys.path at startup. Absolute path so the
-# binary works regardless of cwd. Replaced at "ship time" by a path
-# relative to the binary location once we have appended-resource layout.
+# can find vendor/holo/src on sys.path at startup. TAI_EMBED_SITE_PKGS
+# is the matching path for the dep closure (mcp, websockets, pyperclip,
+# plus transitive deps including pydantic-core's native .so) installed
+# by `make -C embedded deps`. Both absolute so the binary works
+# regardless of cwd. Replaced at "ship time" by paths relative to the
+# binary location once we have appended-resource layout.
 EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13 \
-	       -DTAI_VENDOR_HOLO_PATH='"$(abspath $(srcdir))/vendor/holo/src"'
+	       -DTAI_VENDOR_HOLO_PATH='"$(abspath $(srcdir))/vendor/holo/src"' \
+	       -DTAI_EMBED_SITE_PKGS='"$(abspath $(srcdir))/build/site-packages"'
 EMBED_LIBS   = -L$(EMBED_CPYTHON_PREFIX)/lib/python3.13/config-3.13-darwin \
 	       -lpython3.13 -L/usr/local/opt/gettext/lib -lintl -ldl \
 	       -framework CoreFoundation

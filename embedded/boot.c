@@ -53,17 +53,22 @@ tai_embedded_serve_stdio (void)
 #ifndef TAI_VENDOR_HOLO_PATH
 #  error "TAI_VENDOR_HOLO_PATH must be -D'd at build time (see Makefile.in)"
 #endif
+#ifndef TAI_EMBED_SITE_PKGS
+#  error "TAI_EMBED_SITE_PKGS must be -D'd at build time (see Makefile.in)"
+#endif
   if (PyRun_SimpleString (
 	"import sys\n"
+	"sys.path.insert(0, '" TAI_EMBED_SITE_PKGS "')\n"
 	"sys.path.insert(0, '" TAI_VENDOR_HOLO_PATH "')\n"
 	"import holo, holo.browser_chrome\n"
-	"print('tai: embedded Python', sys.version.split()[0],\n"
-	"      'imported holo', holo.__version__,\n"
-	"      'with browser_chrome.', len([f for f in dir(holo.browser_chrome)\n"
-	"          if not f.startswith('_')]), 'public names',\n"
-	"      file=sys.stderr)\n") != 0)
+	"from importlib.metadata import version as _v\n"
+	"from mcp.server.fastmcp import FastMCP\n"
+	"print('tai: embedded Python', sys.version.split()[0], file=sys.stderr)\n"
+	"print('tai: holo', holo.__version__, '+ mcp', _v('mcp'),\n"
+	"      '+ pydantic-core', _v('pydantic-core'),\n"
+	"      'imported; FastMCP:', FastMCP.__name__, file=sys.stderr)\n") != 0)
     {
-      fprintf (stderr, "tai: embedded holo import failed\n");
+      fprintf (stderr, "tai: embedded holo+mcp import failed\n");
       Py_Finalize ();
       return 70;
     }

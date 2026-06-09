@@ -9,6 +9,13 @@ BUILD_DIR     := $(TAI_ROOT)/build
 CPYTHON_SRC   := $(TAI_ROOT)/third_party/cpython
 CPYTHON_BUILD := $(BUILD_DIR)/cpython-build
 CPYTHON_PFX   := $(BUILD_DIR)/cpython-install
+SITE_PKGS     := $(BUILD_DIR)/site-packages
+
+# Python 3.13 used for `pip install --target` into SITE_PKGS. Must be
+# 3.13.x to produce wheels with the same ABI as our embedded CPython.
+# Override with `make HOST_PYTHON=/path/to/python3.13` if the autoprobe
+# picks something wrong.
+HOST_PYTHON ?= $(shell command -v python3.13 2>/dev/null || command -v python3 2>/dev/null)
 
 # What we need out of CPython: the static archive + the headers.
 CPYTHON_LIB    := $(CPYTHON_PFX)/lib/libpython3.13.a
@@ -30,16 +37,21 @@ endif
 # Job count for the CPython build.
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-.PHONY: cpython cpython-clean clean help
+.PHONY: cpython cpython-clean deps deps-clean clean help
 
 help:
 	@echo "Embedded-holo build targets:"
 	@echo "  cpython         Configure + build + install static libpython3.13.a"
 	@echo "  cpython-clean   Remove the CPython build directory only"
+	@echo "  deps            Install holo's pure-Python + Rust-extension deps"
+	@echo "                  into build/site-packages/ for embedding"
+	@echo "  deps-clean      Remove build/site-packages/ only"
 	@echo "  clean           Remove everything under build/"
 	@echo ""
 	@echo "Flags:"
 	@echo "  CPYTHON_OPT=1   Enable PGO + LTO (slow; use for release builds)"
+	@echo "  HOST_PYTHON=X   Python 3.13 used to populate site-packages"
+	@echo "                  (current: $(HOST_PYTHON))"
 
 cpython: $(CPYTHON_LIB)
 
@@ -73,6 +85,33 @@ $(CPYTHON_SRC)/configure:
 
 cpython-clean:
 	rm -rf $(CPYTHON_BUILD) $(CPYTHON_PFX)
+
+# What the embedded interpreter needs to import the holo MCP server.
+# Kept minimal — `mcp` brings in the FastMCP framework + its
+# transitive closure (pydantic, anyio, httpx, …). pyobjc is NOT
+# listed here; that's the appended-resource (cache-extract) path.
+EMBED_DEPS = \
+    mcp \
+    websockets \
+    pyperclip
+
+deps: $(SITE_PKGS)/.stamp
+
+$(SITE_PKGS)/.stamp:
+	@if [ -z "$(HOST_PYTHON)" ] || ! $(HOST_PYTHON) --version 2>&1 | grep -q 'Python 3\.13\.'; then \
+	    echo "ERROR: HOST_PYTHON must be Python 3.13.x"; \
+	    echo "  current: $(HOST_PYTHON) ($$($(HOST_PYTHON) --version 2>&1 || echo 'not runnable'))"; \
+	    echo "  override with: make deps HOST_PYTHON=/path/to/python3.13"; \
+	    exit 1; \
+	fi
+	@mkdir -p $(SITE_PKGS)
+	@echo "==> Installing $(EMBED_DEPS) into $(SITE_PKGS)"
+	$(HOST_PYTHON) -m pip install --target $(SITE_PKGS) --upgrade $(EMBED_DEPS)
+	@touch $@
+	@echo "==> $$(du -sh $(SITE_PKGS) | cut -f1) installed"
+
+deps-clean:
+	rm -rf $(SITE_PKGS)
 
 clean:
 	rm -rf $(BUILD_DIR)
