@@ -311,7 +311,14 @@ jobs:
       - name: Adhoc codesign the bundled binary
         run: |
           codesign --force --deep --sign - build/tai-bundled
-          codesign --verify --deep --strict --verbose=2 build/tai-bundled
+          # --strict rejects "extra data after Mach-O", which is
+          # exactly what our 24-byte trailer + appended tarball
+          # is. Same pattern PyInstaller uses for --onefile
+          # artifacts: signed region covers the Mach-O segments,
+          # the trailing payload is read by the runtime itself.
+          # --verify without --strict confirms the signature is
+          # valid for the Mach-O; that's what Gatekeeper checks.
+          codesign --verify --deep --verbose=2 build/tai-bundled
 
       - name: Verify universal2 + smoke test the bundled binary
         run: |
