@@ -43,6 +43,25 @@ CPYTHON_CONFIGURE_FLAGS := \
 ifeq ($(CPYTHON_OPT),1)
 CPYTHON_CONFIGURE_FLAGS += --enable-optimizations --with-lto
 endif
+# Universal2 (arm64 + x86_64 fat) build of libpython3.13.a. Required
+# when the resulting binary is itself going to be linked as
+# universal2 — the release CI sets this. Apple Silicon hosts cross-
+# compile the x86_64 slice via Apple's bundled SDK.
+ifeq ($(TAI_UNIVERSAL2),1)
+CPYTHON_CONFIGURE_FLAGS += \
+    --enable-universalsdk=/ \
+    --with-universal-archs=universal2
+endif
+# Point CPython at a pre-built (universal2) OpenSSL so the _ssl C
+# extension gets compiled. Without this, anyio (transitive dep of
+# mcp) crashes on import with `ModuleNotFoundError: No module
+# named '_ssl'`. The CI workflow stages OpenSSL universal2 to
+# build/openssl-install and sets this var; local dev builds default
+# to whatever Homebrew openssl finds on PATH (which is single-arch
+# but adequate for dev).
+ifneq ($(TAI_OPENSSL_PREFIX),)
+CPYTHON_CONFIGURE_FLAGS += --with-openssl=$(TAI_OPENSSL_PREFIX)
+endif
 
 # Job count for the CPython build.
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)

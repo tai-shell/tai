@@ -161,9 +161,24 @@ EMBED_CPYTHON_PREFIX = $(srcdir)/build/cpython-install
 # are siblings of the binary (which is the dev-tree layout) or get
 # laid out the same way by the install step.
 EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13
-EMBED_LIBS   = -L$(EMBED_CPYTHON_PREFIX)/lib/python3.13/config-3.13-darwin \
-	       -lpython3.13 -L/usr/local/opt/gettext/lib -lintl -ldl \
-	       -framework CoreFoundation
+# Query python3.13-config at make time so libpython's search path
+# and any system libs CPython picked up at its own configure (libintl
+# via Homebrew gettext, at /opt/homebrew on Apple Silicon, /usr/local
+# on Intel) flow through dynamically. Hardcoding bit us in CI on
+# Apple Silicon where the legacy Intel path doesn't exist. Falls
+# back to empty (and a clearer "library 'python3.13' not found" link
+# error) when CPython hasn't been built — run `make -C embedded
+# cpython` first.
+EMBED_PYCFG = $(EMBED_CPYTHON_PREFIX)/bin/python3.13-config
+# Filter -lintl: bash already bundles libintl statically via
+# lib/intl/libintl.a (which links earlier in the command line and
+# is universal2 because it's built with bash's CFLAGS). CPython's
+# --ldflags --embed adds another -lintl that the linker then tries
+# to satisfy from the system search path. On Apple Silicon (CI),
+# Homebrew lives at /opt/homebrew/lib which isn't on the linker's
+# default search path; dropping the duplicate lets bash's bundled
+# libintl satisfy libpython3.13.a's gettext references.
+EMBED_LIBS := $(filter-out -lintl,$(shell test -x $(EMBED_PYCFG) && $(EMBED_PYCFG) --ldflags --embed))
 
 STATIC_LD = @STATIC_LD@
 LOCAL_LDFLAGS = @LOCAL_LDFLAGS@
