@@ -1,0 +1,19 @@
+{
+  "name": "@holo/bookmarklet",
+  "private": true,
+  "type": "module",
+  "description": "In-page agent for the holo browser-automation primitive (bookmarklet payload).",
+  "scripts": {
+    "test": "node --test test/framing.test.js test/title.test.js test/dispatch.test.js test/core.test.js",
+    "build": "node build.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  },
+  "dependencies": {
+    "qrcode-generator": "^2.0.4"
+  }
+}

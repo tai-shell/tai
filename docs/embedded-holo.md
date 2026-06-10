@@ -248,15 +248,41 @@ Build flow:
 4. Link: tai .o files + frozen_holo.o + libpython3.13.a + native_payload.o → `tai`.
 5. Install: copy `tai` + create symlinks (`tcsh`, optionally `bash`/`sh`).
 
-Holo subtree sync:
+### Holo subtree sync
+
+The vendored holo code lives under `vendor/holo/`. `git subtree` is used (not submodule) so a fresh clone has the sources present without an `--init` dance and so subtree commits land in tai's history as ordinary squash + merge commits.
+
+**One-time setup on a fresh clone** (subtree needs to know where to fetch from; the URL isn't stored in the working tree):
 
 ```
-$ git subtree pull --prefix vendor/holo holo <tag>
+$ git remote add holo git@github.com:nospaceleftondevice/holo.git
+$ git fetch holo --tags
 ```
 
-Two-way upstream is supported via `git subtree push` if a tai-side change touches vendored holo code (rare; the contract is mostly stable).
+**Initial import** (already done at `vendor/holo` for `v0.1.0a32`, recorded as commit `4788d77`):
 
-The dispatch protocol spec (`docs/dispatch-protocol.md`) lives authoritatively in the **holo** repo and is referenced by tai's `agent_dispatch.c` comments. Tai vendors a read-only copy.
+```
+$ git subtree add --prefix=vendor/holo holo v0.1.0a32 --squash
+```
+
+**Bumping the pin** to a newer release tag:
+
+```
+$ git fetch holo --tags
+$ git subtree pull --prefix=vendor/holo holo <new-tag> --squash
+```
+
+The squash commit's message records which holo commit the vendored tree was synced from, so `git log -- vendor/holo` is the authoritative record of "what version is pinned."
+
+**Pushing tai-side changes back to holo** (rare — the contract is stable; do this only when a fix in vendored holo originates in tai's checkout):
+
+```
+$ git subtree push --prefix=vendor/holo holo <branch-on-holo-side>
+```
+
+**What to pin to.** Always a release tag (`v0.1.0a<N>`) — never `main`. Tags are immutable; main moves under us. A holo release that breaks tai (because we pinned to main and main drifted) is harder to diagnose than a deliberate pin bump.
+
+The dispatch protocol spec (`docs/dispatch-protocol.md`) lives authoritatively in the **holo** repo and is referenced by tai's `agent_dispatch.c` comments. Tai vendors a read-only copy under `vendor/holo/docs/`.
 
 ## Sizes and startup cost
 
@@ -330,6 +356,7 @@ If the process is killed (SIGKILL, panic), the SikuliX subprocess detects parent
 - **Bookmarklet.** Dropped. Browser ops are AppleScript-only. Sites where Chrome's "Allow JavaScript from Apple Events" toggle is off lose `browser_execute_js`; that's the trade-off for a smaller binary and fewer moving parts.
 - **Auto-install / auto-update.** The binary is the install. No background updates. Users updating tai get the new bridge through the bundled native payload.
 - **mDNS announce / discovery / capabilities probe.** Tai's control shell is a tool surface, not a discoverable host. Standalone holo retains these for the cases that need them.
+- **Mach-O codesigning / Gatekeeper notarization of the bundled artifact.** `make -C embedded bundle` appends a gzip tarball + 24-byte trailer *after* the Mach-O segments. Any `codesign` signature applied to the input bash is invalidated by the append; `spctl --assess` will reject the bundled file on SIP-enabled Macs that didn't either (a) build it locally, (b) install it via a package manager that ad-hoc resigns post-install, or (c) clear the quarantine attribute (`xattr -d com.apple.quarantine /path/to/tai`). The PR's distribution model is SSH-then-`scp`, not Mac App Store, so this is an explicit trade-off rather than a defect. A future redesign that wants App Store distribution would store the payload as a side-car `.dat` next to the binary (locate via argv[0]-relative path) so the executable can be signed and notarized normally.
 
 ## Open questions
 

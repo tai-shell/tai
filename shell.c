@@ -70,6 +70,8 @@ extern int get_tty_state (void);
 #include "execute_cmd.h"
 #include "findcmd.h"
 
+#include "tai_dispatch.h"
+
 #if defined (USING_BASH_MALLOC) && defined (DEBUG) && !defined (DISABLE_MALLOC_WRAPPERS)
 #  include <malloc/shmalloc.h>
 #elif defined (MALLOC_DEBUG) && defined (USING_BASH_MALLOC)
@@ -374,6 +376,24 @@ int
 main (int argc, char **argv, char **env)
 #endif /* !NO_MAIN_ENV_ARG */
 {
+  /* tai argv[0] dispatch — runs before any bash initialization so the
+     control shell never sets up signal handlers, terminal modes, or
+     job-control state that bash assumes. See docs/embedded-holo.md. */
+  if (argc > 0 && tai_is_control_shell_name (argv[0]))
+    return tai_control_shell_main (argc, argv);
+
+  /* When invoked under any name except `tai' (i.e. as `bash', `sh',
+     `rbash', ..., or via execve with argc == 0 and no argv[0] to
+     check), hide the holo-* builtins from the shell's lookup table.
+     They're still linked in but cleared from the enabled set, so
+     bash behaves indistinguishably from upstream. The control-shell
+     path above never reaches this — only the user shell does.
+
+     The argc == 0 case is POSIX-legal via execve(path, {NULL}, ...)
+     and triggers fail-safe to "plain bash" rather than user shell. */
+  if (argc == 0 || !tai_is_user_shell_name (argv[0]))
+    tai_disable_holo_builtins ();
+
   register int i;
   int code, old_errexit_flag;
 #if defined (RESTRICTED_SHELL)

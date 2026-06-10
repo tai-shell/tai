@@ -1,0 +1,386 @@
+This file is holo.def, from which is created holo.c.
+It implements the embedded-holo shell-builtin surface in tai.
+
+There's one meta builtin (`holo TOOL [ARGS]`) plus 25 per-tool
+builtins (`browser_navigate URL`, `screen_click X Y`, ...) so a tai
+script can read like a shell script instead of an MCP transcript:
+
+  #!/usr/local/bin/tai
+  browser_navigate "https://example.com"
+  url=$(browser_read_active_url)
+  screen_click 480 320
+
+All 26 builtins call the same dispatcher in tai_runtime.shell, which
+introspects the matching FastMCP-decorated tool in tai_runtime.server
+to coerce shell-string arguments to typed Python parameters. See
+docs/embedded-holo.md.
+
+$PRODUCES holo.c
+
+#include <config.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+#include "../bashansi.h"
+#include "../shell.h"
+#include "common.h"
+
+#include "../embedded/boot.h"
+
+/* ----------------------------------------------------------------------
+   Shared dispatch helper used by every holo*_builtin below.
+
+   `tool` is the FastMCP tool name (browser_navigate, screen_click, …).
+   `args_list` is the WORD_LIST of arguments to pass — for the meta
+   `holo` builtin that's everything after the subcommand; for a per-
+   tool wrapper that's the entire argument list.
+   ---------------------------------------------------------------------- */
+
+static int
+tai_holo_dispatch_tool (const char *tool, WORD_LIST *args_list)
+{
+  /* Bring the embedded interpreter up if it isn't already. ~80 ms
+     on first call, ~0 ms thereafter. */
+  if (tai_embedded_ensure_ready () != 0)
+    return EXECUTION_FAILURE;
+
+  /* Count args, then build a Python list. */
+  int argc = 0;
+  for (WORD_LIST *w = args_list; w; w = w->next)
+    argc++;
+
+  PyObject *shell_mod = PyImport_ImportModule ("tai_runtime.shell");
+  if (shell_mod == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "holo: failed to import tai_runtime.shell\n");
+      return EXECUTION_FAILURE;
+    }
+
+  PyObject *py_args = PyList_New ((Py_ssize_t) argc);
+  if (py_args == NULL)
+    {
+      Py_DECREF (shell_mod);
+      PyErr_Print ();
+      return EXECUTION_FAILURE;
+    }
+  int i = 0;
+  for (WORD_LIST *w = args_list; w; w = w->next, i++)
+    {
+      PyObject *item = PyUnicode_FromString (w->word->word);
+      if (item == NULL)
+	{
+	  Py_DECREF (py_args);
+	  Py_DECREF (shell_mod);
+	  PyErr_Print ();
+	  return EXECUTION_FAILURE;
+	}
+      PyList_SET_ITEM (py_args, (Py_ssize_t) i, item); /* steals ref */
+    }
+
+  PyObject *result = PyObject_CallMethod (
+      shell_mod, "dispatch", "(sO)", tool, py_args);
+  Py_DECREF (py_args);
+  Py_DECREF (shell_mod);
+
+  if (result == NULL)
+    {
+      PyErr_Print ();
+      fprintf (stderr, "holo: tai_runtime.shell.dispatch() raised\n");
+      return EXECUTION_FAILURE;
+    }
+
+  long rc = PyLong_AsLong (result);
+  Py_DECREF (result);
+  if (rc == -1 && PyErr_Occurred ())
+    {
+      PyErr_Print ();
+      return EXECUTION_FAILURE;
+    }
+  /* dispatch() returns 0/1/2; mapped directly to shell exit codes. */
+  return (int) rc;
+}
+
+/* ======================================================================
+   Meta builtin: `holo TOOL [ARGS]`
+   ====================================================================== */
+
+$BUILTIN holo
+$FUNCTION holo_builtin
+$SHORT_DOC holo TOOL [ARGS...]
+Invoke an embedded-holo tool by name.
+
+Examples:
+  holo browser_navigate https://example.com
+  url=$(holo browser_read_active_url)
+  holo screen_click 480 320
+
+Every tool is also a top-level builtin (e.g. `browser_navigate URL`
+works on its own); the `holo` meta-builtin is the dispatch surface
+for programmatic / variable-tool-name callers.
+
+Exit Status:
+  0 on success, 1 on tool error, 2 on usage error.
+$END
+
+int
+holo_builtin (WORD_LIST *list)
+{
+  if (list == NULL || list->word == NULL || list->word->word == NULL)
+    {
+      builtin_usage ();
+      return EX_USAGE;
+    }
+  return tai_holo_dispatch_tool (list->word->word, list->next);
+}
+
+/* ======================================================================
+   Per-tool wrappers — 25 builtins, one per FastMCP tool.
+
+   Each body is a one-liner that hardcodes the tool name and forwards
+   the WORD_LIST unchanged to tai_holo_dispatch_tool. The C function
+   names follow the bash convention <name>_builtin.
+   ====================================================================== */
+
+/* ---- browser_* (Chrome via AppleScript) ---------------------------- */
+
+$BUILTIN browser_navigate
+$FUNCTION browser_navigate_builtin
+$SHORT_DOC browser_navigate URL
+Navigate the active Chrome tab to URL.
+$END
+int browser_navigate_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_navigate", list);
+}
+
+$BUILTIN browser_new_tab
+$FUNCTION browser_new_tab_builtin
+$SHORT_DOC browser_new_tab [URL]
+Open a new Chrome tab, optionally navigated to URL.
+$END
+int browser_new_tab_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_new_tab", list);
+}
+
+$BUILTIN browser_close_active_tab
+$FUNCTION browser_close_active_tab_builtin
+$SHORT_DOC browser_close_active_tab
+Close the active Chrome tab.
+$END
+int browser_close_active_tab_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_close_active_tab", list);
+}
+
+$BUILTIN browser_activate_tab
+$FUNCTION browser_activate_tab_builtin
+$SHORT_DOC browser_activate_tab INDEX
+Activate the Chrome tab at the given 1-based index in the front window.
+$END
+int browser_activate_tab_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_activate_tab", list);
+}
+
+$BUILTIN browser_list_tabs
+$FUNCTION browser_list_tabs_builtin
+$SHORT_DOC browser_list_tabs
+List all Chrome tabs in the front window (index, title, url) as JSON.
+$END
+int browser_list_tabs_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_list_tabs", list);
+}
+
+$BUILTIN browser_read_active_url
+$FUNCTION browser_read_active_url_builtin
+$SHORT_DOC browser_read_active_url
+Print the URL of the active Chrome tab.
+$END
+int browser_read_active_url_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_read_active_url", list);
+}
+
+$BUILTIN browser_read_active_title
+$FUNCTION browser_read_active_title_builtin
+$SHORT_DOC browser_read_active_title
+Print the title of the active Chrome tab.
+$END
+int browser_read_active_title_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_read_active_title", list);
+}
+
+$BUILTIN browser_reload
+$FUNCTION browser_reload_builtin
+$SHORT_DOC browser_reload
+Reload the active Chrome tab.
+$END
+int browser_reload_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_reload", list);
+}
+
+$BUILTIN browser_back
+$FUNCTION browser_back_builtin
+$SHORT_DOC browser_back
+Navigate the active Chrome tab back in history.
+$END
+int browser_back_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_back", list);
+}
+
+$BUILTIN browser_forward
+$FUNCTION browser_forward_builtin
+$SHORT_DOC browser_forward
+Navigate the active Chrome tab forward in history.
+$END
+int browser_forward_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_forward", list);
+}
+
+$BUILTIN browser_execute_js
+$FUNCTION browser_execute_js_builtin
+$SHORT_DOC browser_execute_js JS
+Run a JS snippet in the active Chrome tab via Apple Events.
+
+Requires Chrome > View > Developer > "Allow JavaScript from Apple
+Events" to be enabled, otherwise raises JavaScriptNotAuthorized.
+$END
+int browser_execute_js_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("browser_execute_js", list);
+}
+
+/* ---- app_activate -------------------------------------------------- */
+
+$BUILTIN app_activate
+$FUNCTION app_activate_builtin
+$SHORT_DOC app_activate NAME
+Bring the named application to the foreground (e.g. "Google Chrome").
+$END
+int app_activate_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("app_activate", list);
+}
+
+/* ---- screen_* (SikuliX bridge) ------------------------------------- */
+
+$BUILTIN screen_click
+$FUNCTION screen_click_builtin
+$SHORT_DOC screen_click X Y [MODIFIER...]
+Click at screen coordinates, optionally holding modifiers (e.g. cmd).
+$END
+int screen_click_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_click", list);
+}
+
+$BUILTIN screen_move
+$FUNCTION screen_move_builtin
+$SHORT_DOC screen_move X Y
+Move the cursor to (X, Y). No click, no scroll, no key.
+$END
+int screen_move_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_move", list);
+}
+
+$BUILTIN screen_type
+$FUNCTION screen_type_builtin
+$SHORT_DOC screen_type TEXT
+Type a literal string into whatever has keyboard focus.
+$END
+int screen_type_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_type", list);
+}
+
+$BUILTIN screen_key
+$FUNCTION screen_key_builtin
+$SHORT_DOC screen_key COMBO
+Send a key combo. Examples: "cmd+v", "enter", "shift+tab".
+$END
+int screen_key_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_key", list);
+}
+
+$BUILTIN screen_scroll
+$FUNCTION screen_scroll_builtin
+$SHORT_DOC screen_scroll X Y [DIRECTION] [STEPS]
+Move to (X, Y) and emit STEPS mouse-wheel events in DIRECTION.
+DIRECTION defaults to "down". STEPS defaults to 3.
+$END
+int screen_scroll_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_scroll", list);
+}
+
+$BUILTIN screen_shot
+$FUNCTION screen_shot_builtin
+$SHORT_DOC screen_shot [REGION]
+Capture the screen and print a JSON blob containing a base64 PNG.
+Optional REGION is a JSON object {x,y,width,height}.
+$END
+int screen_shot_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_shot", list);
+}
+
+$BUILTIN screen_find_image
+$FUNCTION screen_find_image_builtin
+$SHORT_DOC screen_find_image NEEDLE [REGION] [SCORE]
+Find NEEDLE (base64-encoded PNG) on screen and print coords or null.
+$END
+int screen_find_image_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_find_image", list);
+}
+
+$BUILTIN screen_user_capture
+$FUNCTION screen_user_capture_builtin
+$SHORT_DOC screen_user_capture [PROMPT] [TIMEOUT]
+Run the interactive drag-rectangle capture; print the dragged rect's PNG.
+$END
+int screen_user_capture_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("screen_user_capture", list);
+}
+
+/* ---- ui_template_* (cached UI element matching) -------------------- */
+
+$BUILTIN ui_template_capture
+$FUNCTION ui_template_capture_builtin
+$SHORT_DOC ui_template_capture LABEL [APP] [REGION] [REPLACE] [SIMILARITY] [TIMEOUT] [PROMPT]
+Save a template image for (APP, LABEL). With no REGION, prompts the
+user to drag-select a rectangle (Esc cancels).
+$END
+int ui_template_capture_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("ui_template_capture", list);
+}
+
+$BUILTIN ui_template_list
+$FUNCTION ui_template_list_builtin
+$SHORT_DOC ui_template_list [APP]
+List stored UI templates. With APP, filter to that app (or "_global").
+$END
+int ui_template_list_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("ui_template_list", list);
+}
+
+$BUILTIN ui_template_find
+$FUNCTION ui_template_find_builtin
+$SHORT_DOC ui_template_find LABEL [APP] [REGION]
+Locate a saved template on the current screen. Print coords or null.
+$END
+int ui_template_find_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("ui_template_find", list);
+}
+
+$BUILTIN ui_template_click
+$FUNCTION ui_template_click_builtin
+$SHORT_DOC ui_template_click LABEL [APP] [REGION]
+Find a saved template and left-click its center. Errors if nothing matches.
+$END
+int ui_template_click_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("ui_template_click", list);
+}
+
+$BUILTIN ui_template_delete
+$FUNCTION ui_template_delete_builtin
+$SHORT_DOC ui_template_delete LABEL [APP] [VARIANT]
+Remove a stored template entry, or one of its variants.
+$END
+int ui_template_delete_builtin (WORD_LIST *list) {
+  return tai_holo_dispatch_tool ("ui_template_delete", list);
+}

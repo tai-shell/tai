@@ -146,7 +146,24 @@ LOCALE_DEFS = -DLOCALEDIR='"$(localedir)"' -DPACKAGE='"$(PACKAGE)"'
 
 LOCAL_LIBS = @LOCAL_LIBS@
 LIBS = $(BUILTINS_LIB) $(LIBRARIES) @LIBS@
-LIBS_FOR_BUILD = 
+LIBS_FOR_BUILD =
+
+# Embedded-holo (tai control shell): static CPython 3.13 lives under
+# build/cpython-install/, produced by `make -C embedded cpython`.
+# These flags get folded into the per-file rule for embedded/boot.o
+# and into the final link of $(Program). Run the CPython build before
+# `make` if you haven't yet; see docs/embedded-holo.md for the flow.
+EMBED_CPYTHON_PREFIX = $(srcdir)/build/cpython-install
+# The three sys.path entries the embedded interpreter needs (vendored
+# holo, the pip dep closure, the tai_runtime package) are computed
+# at runtime from the executable's location — see tai_resolve_exe_dir
+# in embedded/boot.c. The binary is relocatable as long as the dirs
+# are siblings of the binary (which is the dev-tree layout) or get
+# laid out the same way by the install step.
+EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13
+EMBED_LIBS   = -L$(EMBED_CPYTHON_PREFIX)/lib/python3.13/config-3.13-darwin \
+	       -lpython3.13 -L/usr/local/opt/gettext/lib -lintl -ldl \
+	       -framework CoreFoundation
 
 STATIC_LD = @STATIC_LD@
 LOCAL_LDFLAGS = @LOCAL_LDFLAGS@
@@ -484,7 +501,8 @@ CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
 	   input.c bashhist.c array.c arrayfunc.c assoc.c sig.c pathexp.c \
 	   unwind_prot.c siglist.c bashline.c bracecomp.c error.c \
 	   list.c stringlib.c locale.c findcmd.c redir.c \
-	   pcomplete.c pcomplib.c syntax.c xmalloc.c
+	   pcomplete.c pcomplib.c syntax.c xmalloc.c \
+	   agent_dispatch.c tai_dispatch.c
 
 HSOURCES = shell.h flags.h trap.h hashcmd.h hashlib.h jobs.h builtins.h \
 	   general.h variables.h config.h $(ALLOC_HEADERS) alias.h \
@@ -533,7 +551,8 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
 	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O) \
-	   agent_dispatch.o
+	   agent_dispatch.o tai_dispatch.o embedded/boot.o embedded/payload.o \
+	   embedded/extract.o
 
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
@@ -633,9 +652,26 @@ LOADABLES_DIR = ${top_builddir}/examples/loadables
 
 $(Program): $(OBJECTS) $(BUILTINS_DEP) $(LIBDEP) .build
 	$(RM) $@
-	$(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program) $(OBJECTS) $(LIBS)
+	$(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program) $(OBJECTS) $(LIBS) $(EMBED_LIBS)
 	ls -l $(Program)
 	-$(SIZE) $(Program)
+
+# Per-file rule for the embedded-Python boot: needs Python.h on the
+# include path. Done as an explicit rule so we don't add Python's
+# include dir to every translation unit's CFLAGS.
+embedded/boot.o: $(srcdir)/embedded/boot.c $(srcdir)/embedded/boot.h $(srcdir)/embedded/payload.h
+	@mkdir -p embedded
+	$(CC) -c $(CCFLAGS) $(EMBED_CFLAGS) -o $@ $(srcdir)/embedded/boot.c
+
+# Per-file rule for the payload trailer reader. Plain C — no Python
+# headers needed — so it links cleanly into a non-bundled binary too.
+embedded/payload.o: $(srcdir)/embedded/payload.c $(srcdir)/embedded/payload.h
+	@mkdir -p embedded
+	$(CC) -c $(CCFLAGS) -o $@ $(srcdir)/embedded/payload.c
+
+embedded/extract.o: $(srcdir)/embedded/extract.c $(srcdir)/embedded/extract.h $(srcdir)/embedded/payload.h
+	@mkdir -p embedded
+	$(CC) -c $(CCFLAGS) -o $@ $(srcdir)/embedded/extract.c
 
 .build:	$(SOURCES) config.h Makefile $(DEFDIR)/builtext.h version.h $(VERSPROG)
 	@echo
@@ -1362,6 +1398,7 @@ xmalloc.o: ${BASHINCDIR}/stdc.h $(ALLOC_LIBSRC)/shmalloc.h
 
 agent_dispatch.o: config.h config-top.h bashtypes.h bashansi.h ${BASHINCDIR}/ansi_stdlib.h
 agent_dispatch.o: shell.h xmalloc.h externs.h agent_dispatch.h ${BASHINCDIR}/stdc.h
+tai_dispatch.o: config.h bashtypes.h bashansi.h shell.h tai_dispatch.h ${BASHINCDIR}/stdc.h
 
 # job control
 

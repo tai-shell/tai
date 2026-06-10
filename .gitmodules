@@ -1,0 +1,7 @@
+[submodule "third_party/cpython"]
+	path = third_party/cpython
+	url = https://github.com/python/cpython.git
+	# Allow shallow submodule clones so fresh checkouts don't pull
+	# CPython's full ~600 MB history just to get one tagged ref.
+	# Honored when users pass --shallow-submodules to git clone.
+	shallow = true

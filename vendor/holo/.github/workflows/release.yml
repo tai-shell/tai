@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required for `softprops/action-gh-release` to upload assets
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is Apple Silicon; we install python.org's universal2
+          # Python so PyInstaller emits a single binary that runs natively
+          # on both arm64 and Intel Macs. macos-13 (x86-only runners) is
+          # consistently queue-starved on GHA and not worth the wait when
+          # universal2 covers the same userbase.
+          - runner: macos-14
+            target: macos-universal2
+            artifact: holo-macos-universal2
+            python: universal2
+          - runner: ubuntu-latest
+            target: linux-x86_64
+            artifact: holo-linux-x86_64
+            python: setup-python
+          - runner: windows-latest
+            target: windows-x86_64
+            artifact: holo-windows-x86_64.exe
+            python: setup-python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-python doesn't ship a universal2 Python on macOS,
+      # so on the macos-14 runner we install python.org's universal2 PKG
+      # directly. The interpreter ends up at
+      # /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+      # and PyInstaller picks up its arch automatically.
+      - name: Set up universal2 Python (macOS)
+        if: matrix.python == 'universal2'
+        run: |
+          PY_VER=3.12.7
+          curl -fsSL -o python-installer.pkg \
+            "https://www.python.org/ftp/python/${PY_VER}/python-${PY_VER}-macos11.pkg"
+          sudo installer -pkg python-installer.pkg -target /
+          PY_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin
+          echo "${PY_BIN}" >> "$GITHUB_PATH"
+          "${PY_BIN}/python3" -c 'import platform; print("arch:", platform.mac_ver(), platform.machine())'
+          file "${PY_BIN}/python3"
+
+      - name: Set up Python (Linux/Windows)
+        if: matrix.python == 'setup-python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bookmarklet/package-lock.json
+
+      - name: Build bookmarklet
+        working-directory: bookmarklet
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # On macOS universal2, any package without a universal2 wheel on
+      # PyPI ends up single-arch (arm64 since the runner is arm64), and
+      # PyInstaller's universal2 build refuses to bundle a single-arch
+      # .so. Auto-discover offenders by scanning site-packages, then per
+      # offender try two strategies in order:
+      #
+      #   1. If the package ships a `py3-none-any` (pure-Python) wheel
+      #      alongside its binary wheels, install the pure-Python one.
+      #      Speedup is gone; pure Python is fine for our use. (e.g.
+      #      websockets ships only arm64 + py3-none-any — no x86_64
+      #      wheel to fuse with.)
+      #
+      #   2. Otherwise fuse the arm64 + x86_64 wheels into a universal2
+      #      wheel via `delocate-merge` (delocate 0.13+ API; older
+      #      `delocate-fuse` was removed). Works for any precompiled
+      #      native ext (C, Rust, …) without a build toolchain in CI.
+      - name: Make native extensions universal2 (macOS)
+        if: matrix.python == 'universal2'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          # python.org's universal2 installer ships `python3`/`pip3` but
+          # no bare `pip` on PATH; use `python -m pip` and invoke
+          # delocate via its module entrypoint.
+          python -m pip install delocate
+          mkdir -p /tmp/wheels
+
+          # Discover packages with single-arch .so files. Iterate every
+          # installed distribution's files so we catch installs in
+          # framework site-packages, user-site, or anywhere else.
+          # Skip .so files under tests/test dirs — those are fixtures
+          # (delocate ships single-arch .so test data), not loaded code.
+          # Output `name==version` so the fuse step pins the pure-Python
+          # check to the right version (without a pin pip silently walks
+          # back the release history and might grab an ancient stub
+          # release — pydantic-core 0.0.1 was a placeholder before the
+          # Rust impl shipped at 2.x).
+          python > /tmp/bad_pkgs.txt <<'PY'
+          import os, subprocess
+          from importlib.metadata import distributions
+
+          bad = {}
+          for dist in distributions():
+              name = dist.metadata["Name"]
+              version = dist.version
+              for f in (dist.files or []):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if not ("arm64" in archs and "x86_64" in archs):
+                      bad[name] = version
+                      break
+          for n, v in sorted(bad.items()):
+              print(f"{n}=={v}")
+          PY
+
+          echo "::group::offenders"
+          cat /tmp/bad_pkgs.txt
+          echo "::endgroup::"
+
+          fuse_pkg() {
+            local spec=$1   # "name==version"
+            local pkg_name=${spec%%==*}
+            local pkg_version=${spec##*==}
+            local slug=${spec//[^A-Za-z0-9]/_}
+            local arm_dir="/tmp/wheels/${slug}-arm64"
+            local x86_dir="/tmp/wheels/${slug}-x86"
+            local out_dir="/tmp/wheels/${slug}-out"
+            rm -rf "$arm_dir" "$x86_dir" "$out_dir"
+            mkdir -p "$arm_dir" "$x86_dir" "$out_dir"
+
+            # Try pure-Python wheel for the discovered version. Pinning
+            # is critical: unpinned, pip walks release history for a
+            # py3-none-any match and can land on an ancient stub
+            # (pydantic-core 0.0.1 predates the Rust impl).
+            if python -m pip download --no-deps --only-binary=:all: \
+                 --platform any --python-version 3.12 \
+                 --dest "$out_dir" "$spec" >/dev/null 2>&1; then
+              local pure_whl
+              pure_whl=$(ls "$out_dir"/*-py3-none-any.whl 2>/dev/null \
+                         || ls "$out_dir"/*-py2.py3-none-any.whl 2>/dev/null \
+                         || true)
+              if [ -n "$pure_whl" ]; then
+                echo "  → pure-Python: $(basename "$pure_whl")"
+                python -m pip install --force-reinstall --no-deps "$pure_whl"
+                return 0
+              fi
+            fi
+
+            # Fuse arm64+x86_64 wheels. Try pinned first; if x86_64 has
+            # no wheel at this version (newer releases sometimes drop it
+            # — cffi 2.0.0 is arm64-only), fall back to x86_64 unpinned
+            # and re-anchor arm64 to whatever version that resolves to.
+            rm -rf "$out_dir"; mkdir -p "$out_dir"
+            if ! python -m pip download --no-deps --only-binary=:all: \
+                   --platform macosx_10_12_x86_64 --python-version 3.12 \
+                   --dest "$x86_dir" "$spec" 2>/dev/null; then
+              echo "  ! no x86_64 wheel for $spec — falling back to latest with x86_64"
+              rm -rf "$x86_dir"; mkdir -p "$x86_dir"
+              python -m pip download --no-deps --only-binary=:all: \
+                --platform macosx_10_12_x86_64 --python-version 3.12 \
+                --dest "$x86_dir" "$pkg_name"
+            fi
+            local x86_whl
+            x86_whl=$(ls "$x86_dir"/*.whl)
+            local fuse_version
+            fuse_version=$(basename "$x86_whl" | awk -F- '{print $2}')
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform macosx_11_0_arm64 --python-version 3.12 \
+              --dest "$arm_dir" "${pkg_name}==${fuse_version}"
+            local arm_whl fused_whl
+            arm_whl=$(ls "$arm_dir"/*.whl)
+            python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
+            fused_whl=$(ls "$out_dir"/*.whl)
+            echo "  → fused: $(basename "$fused_whl") (version $fuse_version)"
+            python -m pip install --force-reinstall --no-deps "$fused_whl"
+          }
+
+          while read -r pkg; do
+            [ -z "$pkg" ] && continue
+            echo "::group::fuse $pkg"
+            fuse_pkg "$pkg"
+            echo "::endgroup::"
+          done < /tmp/bad_pkgs.txt
+
+          # Final scan: every .so belonging to an installed distribution
+          # (excluding test fixtures) must be universal2.
+          echo "::group::verify universal2"
+          python <<'PY'
+          import os, subprocess, sys
+          from importlib.metadata import distributions
+
+          bad = []
+          for dist in distributions():
+              for f in (dist.files or []):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if "arm64" in archs and "x86_64" in archs:
+                      print(f"OK {full} ({archs})")
+                  else:
+                      bad.append((full, archs))
+                      print(f"BAD {full} ({archs})")
+          if bad:
+              print(f"\n{len(bad)} single-arch .so still present", file=sys.stderr)
+              sys.exit(1)
+          PY
+          echo "::endgroup::"
+
+      # Tests run on every PR via ci.yml. The release workflow's job is
+      # to build binaries; we only re-run pytest on darwin where the
+      # current suite has been validated. Linux / Windows will get
+      # platform-specific test runs once we port the macOS-leaning bits.
+      - name: Run tests
+        if: runner.os == 'macOS'
+        run: pytest -ra
+
+      - name: Build binary with PyInstaller
+        env:
+          HOLO_TARGET_ARCH: ${{ matrix.python == 'universal2' && 'universal2' || '' }}
+        run: pyinstaller --clean holo.spec
+
+      # PyInstaller emits an adhoc-signed Mach-O on macOS, but the
+      # signature embedded during the universal2 fuse occasionally
+      # passes `codesign --verify` while still being rejected by the
+      # kernel at load time on user machines (`load code signature
+      # error 2` / EBADEXEC, process SIGKILL'd before any code runs).
+      # Restamping with a fresh adhoc signature here rewrites the
+      # LC_CODE_SIGNATURE load command with correct offsets and dodges
+      # the issue without requiring a Developer ID cert.
+      - name: Re-sign binary (macOS adhoc)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - dist/holo
+          codesign --verify --deep --strict --verbose=2 dist/holo
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p out
+          cp dist/holo "out/${{ matrix.artifact }}"
+          chmod +x "out/${{ matrix.artifact }}"
+          ls -la out/
+          file "out/${{ matrix.artifact }}"
+          # Sanity-check the universal2 build — should report two arches.
+          if [ "${{ matrix.python }}" = "universal2" ]; then
+            archs=$(lipo -archs "out/${{ matrix.artifact }}")
+            echo "lipo archs: ${archs}"
+            case "${archs}" in
+              *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
+              *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
+            esac
+          fi
+          ./out/${{ matrix.artifact }} --version
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist\holo.exe "out\${{ matrix.artifact }}"
+          Get-ChildItem out
+          & ".\out\${{ matrix.artifact }}" --version
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  bookmarklet:
+    name: Build bookmarklet asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bookmarklet/package-lock.json
+
+      - name: Build bookmarklet
+        working-directory: bookmarklet
+        run: |
+          npm ci
+          npm run build
+
+      # `install.html` is a self-contained drag-to-bookmarks-bar page —
+      # the `javascript:` URL has all the bookmarklet JS inlined. Ship
+      # it as a release asset so users on a fresh machine can curl it
+      # without cloning the repo or building anything. Renamed to
+      # `holo-bookmarklet.html` so it sits alongside the `holo-*`
+      # binaries in the release file list.
+      - name: Stage bookmarklet asset
+        run: |
+          mkdir -p out
+          cp bookmarklet/dist/install.html out/holo-bookmarklet.html
+          ls -la out/
+
+      - name: Upload bookmarklet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: holo-bookmarklet.html
+          path: out/holo-bookmarklet.html
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [build, bookmarklet]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p assets
+          find artifacts -type f -exec cp {} assets/ \;
+          ls -la assets/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Auto-flag tags with PEP 440 pre-release suffixes (e.g.
+          # v0.1.0a1, v0.1.0b2, v0.1.0rc1) as pre-releases. Stable
+          # tags (v0.1.0, v1.0.0) get marked stable. Saves a manual
+          # `gh release edit --prerelease` after every alpha tag.
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
