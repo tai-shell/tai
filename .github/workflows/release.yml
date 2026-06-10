@@ -310,15 +310,19 @@ jobs:
       # opt-out. Mirrors holo's `Re-sign binary (macOS adhoc)` step.
       - name: Adhoc codesign the bundled binary
         run: |
-          codesign --force --deep --sign - build/tai-bundled
-          # --strict rejects "extra data after Mach-O", which is
-          # exactly what our 24-byte trailer + appended tarball
-          # is. Same pattern PyInstaller uses for --onefile
-          # artifacts: signed region covers the Mach-O segments,
-          # the trailing payload is read by the runtime itself.
-          # --verify without --strict confirms the signature is
-          # valid for the Mach-O; that's what Gatekeeper checks.
-          codesign --verify --deep --verbose=2 build/tai-bundled
+          # Strip the existing signature first. The bash binary
+          # comes out of clang ad-hoc signed; `make bundle` then
+          # appends our 24-byte trailer + gzip tarball AFTER the
+          # signed region, which `codesign --force --sign` rejects
+          # with "main executable failed strict validation" when
+          # asked to replace the now-broken signature in place.
+          # Removing first puts us in a clean state.
+          codesign --remove-signature build/tai-bundled || true
+          codesign --sign - build/tai-bundled
+          # --verify without --strict — see comment further down
+          # about why --strict can't pass on a trailer-appended
+          # Mach-O. Same pattern PyInstaller --onefile uses.
+          codesign --verify --verbose=2 build/tai-bundled
 
       - name: Verify universal2 + smoke test the bundled binary
         run: |
