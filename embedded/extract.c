@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,35 @@
 #include <unistd.h>
 
 #include "extract.h"
+
+/* Block SIGCHLD across our fork+waitpid pairs.
+
+   Why: when extraction runs from a `tai`-named invocation, the lazy
+   Py_Initialize path fires from inside a holo builtin AFTER bash has
+   installed its sigchld_handler (via initialize_job_control). That
+   handler calls waitpid(-1, WNOHANG) on every SIGCHLD and harvests
+   ANY child it doesn't recognize. If it fires in the window between
+   our fork returning and our specific waitpid(pid), bash reaps our
+   tar/rm child first and our waitpid returns -1/ECHILD, surfacing
+   as a spurious "tar -xz failed" / "waitpid failed" error.
+
+   Fix: block SIGCHLD around each fork+waitpid pair. Children
+   restore the original mask before exec so the spawned process
+   isn't started with an unusual signal mask. */
+static int
+tai_block_sigchld (sigset_t *oldmask_out)
+{
+  sigset_t blockmask;
+  sigemptyset (&blockmask);
+  sigaddset (&blockmask, SIGCHLD);
+  return sigprocmask (SIG_BLOCK, &blockmask, oldmask_out);
+}
+
+static void
+tai_restore_sigmask (const sigset_t *oldmask)
+{
+  sigprocmask (SIG_SETMASK, oldmask, NULL);
+}
 
 /* Render the 24-byte trailer as 48 lowercase hex characters into
    out (which must hold >= 49 bytes including the terminator). */
@@ -72,14 +102,20 @@ mkdir_p (const char *path)
 static void
 rm_rf (const char *path)
 {
+  sigset_t oldmask;
+  tai_block_sigchld (&oldmask);
   pid_t pid = fork ();
   if (pid == 0)
     {
+      /* Restore the original signal mask before exec so the child
+	 doesn't start with SIGCHLD blocked. */
+      tai_restore_sigmask (&oldmask);
       execlp ("rm", "rm", "-rf", path, (char *) NULL);
       _exit (127);
     }
   if (pid > 0)
     waitpid (pid, NULL, 0);
+  tai_restore_sigmask (&oldmask);
 }
 
 /* Stream `length` bytes from `src_fd` (already positioned) into the
@@ -111,23 +147,38 @@ stream_payload_to_pipe (int src_fd, int pipe_w, off_t length)
 
 /* Spawn `tar -xz -C dest_dir`, return its stdin write-fd in *pipe_w
    and its pid in *child_pid. The caller writes payload bytes to
-   *pipe_w, then closes it, then waitpid()s on *child_pid. */
+   *pipe_w, then closes it, then waitpid()s on *child_pid.
+
+   Blocks SIGCHLD before forking and stashes the old mask in
+   *oldmask_out so a peer sigchld_handler (bash's, in the user-shell
+   path) can't reap our tar child first. Caller MUST restore the
+   mask via tai_restore_sigmask(oldmask_out) after its waitpid. */
 static int
-spawn_tar (const char *dest_dir, int *pipe_w, pid_t *child_pid)
+spawn_tar (const char *dest_dir, int *pipe_w, pid_t *child_pid,
+	   sigset_t *oldmask_out)
 {
   int fds[2];
   if (pipe (fds) != 0)
     return -1;
+  if (tai_block_sigchld (oldmask_out) != 0)
+    {
+      close (fds[0]);
+      close (fds[1]);
+      return -1;
+    }
   pid_t pid = fork ();
   if (pid < 0)
     {
+      tai_restore_sigmask (oldmask_out);
       close (fds[0]);
       close (fds[1]);
       return -1;
     }
   if (pid == 0)
     {
-      /* child */
+      /* child — restore the original mask before exec so tar runs
+	 with normal signal semantics. */
+      tai_restore_sigmask (oldmask_out);
       if (dup2 (fds[0], STDIN_FILENO) < 0)
 	_exit (127);
       close (fds[0]);
@@ -223,7 +274,8 @@ tai_payload_ensure_extracted (const char *exe_path,
 
   int pipe_w;
   pid_t child;
-  if (spawn_tar (tmp_dir, &pipe_w, &child) != 0)
+  sigset_t spawn_oldmask;
+  if (spawn_tar (tmp_dir, &pipe_w, &child, &spawn_oldmask) != 0)
     {
       fprintf (stderr, "tai: failed to spawn tar\n");
       close (src_fd);
@@ -235,8 +287,13 @@ tai_payload_ensure_extracted (const char *exe_path,
   close (pipe_w);
   close (src_fd);
 
+  /* SIGCHLD stays blocked from spawn_tar through this waitpid so a
+     peer sigchld_handler (bash's, in the user-shell path) can't reap
+     `child` first and turn our waitpid into ECHILD. */
   int status;
-  if (waitpid (child, &status, 0) < 0)
+  int waitpid_rc = waitpid (child, &status, 0);
+  tai_restore_sigmask (&spawn_oldmask);
+  if (waitpid_rc < 0)
     {
       fprintf (stderr, "tai: waitpid on tar failed: %s\n",
 	       strerror (errno));
