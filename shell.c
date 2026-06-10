@@ -382,6 +382,15 @@ main (int argc, char **argv, char **env)
   if (argc > 0 && tai_is_control_shell_name (argv[0]))
     return tai_control_shell_main (argc, argv);
 
+  /* When invoked under any name except `tai' or `tcsh' (i.e. as
+     `bash', `sh', `rbash', ...), hide the holo-* builtins from the
+     shell's lookup table. They're still linked in but cleared from
+     the enabled set, so bash behaves indistinguishably from upstream.
+     The control-shell path above never reaches this — only the user
+     shell does. */
+  if (argc > 0 && !tai_is_user_shell_name (argv[0]))
+    tai_disable_holo_builtins ();
+
   register int i;
   int code, old_errexit_flag;
 #if defined (RESTRICTED_SHELL)

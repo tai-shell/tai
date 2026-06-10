@@ -27,4 +27,13 @@ extern int tai_is_user_shell_name PARAMS((const char *argv0));
    Returns the process exit code. Does not return to bash main. */
 extern int tai_control_shell_main PARAMS((int argc, char **argv));
 
+/* Walk the static shell-builtins table and clear BUILTIN_ENABLED on
+   every holo* / app_activate / browser_* / screen_* / ui_template_*
+   entry. Called from shell.c's main when argv[0] is not "tai" or
+   "tcsh" so a bash invocation of the multi-call binary stays
+   indistinguishable from upstream bash. The builtin C functions are
+   still linked in (link-time-only would require conditional .o),
+   but bash's lookup ignores them once the flag is cleared. */
+extern void tai_disable_holo_builtins PARAMS((void));
+
 #endif /* _TAI_DISPATCH_H_ */

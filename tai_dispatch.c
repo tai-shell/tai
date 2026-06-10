@@ -13,6 +13,8 @@
 #include "bashansi.h"
 #include "shell.h"
 
+#include "builtins.h"
+
 #include "tai_dispatch.h"
 #include "embedded/boot.h"
 
@@ -47,4 +49,41 @@ tai_control_shell_main (int argc, char **argv)
   (void) argc;
   (void) argv;
   return tai_embedded_serve_stdio ();
+}
+
+/* Prefix-based identification of the holo-builtin family. Simpler
+   and more robust than maintaining a hardcoded list — if a future
+   commit adds a new browser_/screen_/ui_template_ tool, this picks
+   it up for free. */
+static int
+tai_is_holo_builtin_name (const char *name)
+{
+  if (name == NULL)
+    return 0;
+  if (strcmp (name, "holo") == 0)
+    return 1;
+  if (strcmp (name, "app_activate") == 0)
+    return 1;
+  if (strncmp (name, "browser_", 8) == 0)
+    return 1;
+  if (strncmp (name, "screen_", 7) == 0)
+    return 1;
+  if (strncmp (name, "ui_template_", 12) == 0)
+    return 1;
+  return 0;
+}
+
+void
+tai_disable_holo_builtins (void)
+{
+  /* shell_builtins is bash's runtime view of the builtin table; it
+     starts as a pointer into static_shell_builtins, so mutating the
+     entries via shell_builtins also mutates the static table. We
+     clear BUILTIN_ENABLED — the same flag `enable -n NAME' clears.
+     bash's lookup (find_shell_builtin) treats unmarked entries as
+     not-installed, so `type browser_navigate' under bash returns
+     `command not found' just like upstream. */
+  for (int i = 0; i < num_shell_builtins; i++)
+    if (tai_is_holo_builtin_name (shell_builtins[i].name))
+      shell_builtins[i].flags &= ~BUILTIN_ENABLED;
 }
