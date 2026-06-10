@@ -21,12 +21,18 @@
 static const char *
 tai_basename (const char *path)
 {
-  const char *p;
+  const char *p, *base;
 
   if (path == 0)
     return "";
   p = strrchr (path, '/');
-  return p ? p + 1 : path;
+  base = p ? p + 1 : path;
+  /* Strip the leading '-' that login(1) prepends to argv[0] for a
+     login shell, so `chsh -s /usr/local/bin/tai` (which lands with
+     argv[0]="-tai") still routes through the user-shell branch. */
+  if (base[0] == '-')
+    base++;
+  return base;
 }
 
 int

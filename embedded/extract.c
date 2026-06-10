@@ -160,6 +160,17 @@ rm_rf (const char *path)
   sigset_t oldmask;
   tai_block_sigchld (&oldmask);
   pid_t pid = fork ();
+  if (pid < 0)
+    {
+      /* fork() exhausted process slots or RLIMIT_NPROC. The temp dir
+	 we were asked to clean up will linger until the next run's
+	 sweep_stale_tmp_dirs picks it up. Better than silently
+	 deadlocking the parent. */
+      fprintf (stderr, "tai: rm_rf: fork() failed: %s\n",
+	       strerror (errno));
+      tai_restore_sigmask (&oldmask);
+      return;
+    }
   if (pid == 0)
     {
       /* Restore the original signal mask before exec so the child
@@ -168,13 +179,18 @@ rm_rf (const char *path)
       execlp ("rm", "rm", "-rf", path, (char *) NULL);
       _exit (127);
     }
-  if (pid > 0)
-    waitpid (pid, NULL, 0);
+  waitpid (pid, NULL, 0);
   tai_restore_sigmask (&oldmask);
 }
 
 /* Stream `length` bytes from `src_fd` (already positioned) into the
-   pipe whose write-end is `pipe_w`. Returns 0 on success. */
+   pipe whose write-end is `pipe_w`. Returns 0 on success.
+
+   EINTR retry: extraction can take hundreds of ms on a cold cache;
+   any signal that fires during the loop (SIGWINCH from a terminal
+   resize, SIGUSR1, SIGCHLD slipping through if our block is somehow
+   defeated) would otherwise abort with -1 and the caller would
+   surface "tar -xz failed" for what is really a benign retry. */
 static int
 stream_payload_to_pipe (int src_fd, int pipe_w, off_t length)
 {
@@ -184,13 +200,23 @@ stream_payload_to_pipe (int src_fd, int pipe_w, off_t length)
     {
       size_t want = remaining > (off_t) sizeof buf
 		    ? sizeof buf : (size_t) remaining;
-      ssize_t n = read (src_fd, buf, want);
+      ssize_t n;
+      do
+	{
+	  n = read (src_fd, buf, want);
+	}
+      while (n < 0 && errno == EINTR);
       if (n <= 0)
 	return -1;
       ssize_t off = 0;
       while (off < n)
 	{
-	  ssize_t w = write (pipe_w, buf + off, (size_t) (n - off));
+	  ssize_t w;
+	  do
+	    {
+	      w = write (pipe_w, buf + off, (size_t) (n - off));
+	    }
+	  while (w < 0 && errno == EINTR);
 	  if (w <= 0)
 	    return -1;
 	  off += w;

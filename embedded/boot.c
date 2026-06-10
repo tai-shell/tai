@@ -113,28 +113,41 @@ tai_paths_from_dev_tree (const char *exe_dir,
 	    "%s/vendor/holo/bridge/bridge.py",   exe_dir);
 }
 
-/* Build a sys.path-setup Python snippet that prepends three paths
-   from `paths`. The order matches the precedence rule: vendored
-   holo wins over the runtime package wins over the pip dep closure.
-   Returns a malloc'd string the caller must free.
+/* Prepend the three runtime paths to sys.path via the C API.
 
-   We don't quote-escape because realpath() / cache-dir paths won't
-   contain quote chars on any plausible filesystem we care about. */
-static char *
-tai_format_path_setup (const tai_runtime_paths_t *paths)
+   Done with PySys_GetObject + PyList_Insert (instead of building a
+   Python source snippet and PyRun_SimpleString'ing it) so a path
+   containing a single quote, backslash, or other PEP-3120 quoting
+   hazard can't turn into a SyntaxError at startup. Order matches
+   the precedence rule: vendored holo wins over the runtime package
+   wins over the pip dep closure. Returns 0 on success, -1 on
+   failure (with a Python error indicator set). */
+static int
+tai_apply_path_setup (const tai_runtime_paths_t *paths)
 {
-  size_t cap = (PATH_MAX + 64) * 3 + 128;
-  char *buf = malloc (cap);
-  if (buf == NULL)
-    return NULL;
+  /* sys.path is a borrowed reference owned by sys; don't DECREF it. */
+  PyObject *sys_path = PySys_GetObject ("path");
+  if (sys_path == NULL || !PyList_Check (sys_path))
+    return -1;
 
-  snprintf (buf, cap,
-	    "import sys\n"
-	    "sys.path.insert(0, '%s')\n"
-	    "sys.path.insert(0, '%s')\n"
-	    "sys.path.insert(0, '%s')\n",
-	    paths->site_pkgs, paths->runtime, paths->holo_src);
-  return buf;
+  /* Inserts happen at position 0, so insert in REVERSE priority order
+     to end up with [holo_src, runtime, site_pkgs, ...] in front. */
+  const char *entries[] = {
+    paths->site_pkgs,
+    paths->runtime,
+    paths->holo_src,
+  };
+  for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++)
+    {
+      PyObject *s = PyUnicode_FromString (entries[i]);
+      if (s == NULL)
+	return -1;
+      int rc = PyList_Insert (sys_path, 0, s);
+      Py_DECREF (s);
+      if (rc != 0)
+	return -1;
+    }
+  return 0;
 }
 
 /* Idempotency guard. Once a successful init has happened in this
@@ -236,17 +249,9 @@ _tai_embedded_init (void)
       }
   }
 
-  char *path_setup = tai_format_path_setup (&paths);
-  if (path_setup == NULL)
+  if (tai_apply_path_setup (&paths) != 0)
     {
-      fprintf (stderr, "tai: out of memory composing sys.path setup\n");
-      Py_FinalizeEx ();
-      return -1;
-    }
-  int path_rc = PyRun_SimpleString (path_setup);
-  free (path_setup);
-  if (path_rc != 0)
-    {
+      PyErr_Print ();
       fprintf (stderr, "tai: sys.path setup failed\n");
       Py_FinalizeEx ();
       return -1;

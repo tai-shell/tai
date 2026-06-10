@@ -369,8 +369,8 @@ int ui_template_find_builtin (WORD_LIST *list) {
 
 $BUILTIN ui_template_click
 $FUNCTION ui_template_click_builtin
-$SHORT_DOC ui_template_click LABEL [APP] [REGION] [BUTTON] [CLICKS]
-Find a saved template and click its center. Errors if nothing matches.
+$SHORT_DOC ui_template_click LABEL [APP] [REGION]
+Find a saved template and left-click its center. Errors if nothing matches.
 $END
 int ui_template_click_builtin (WORD_LIST *list) {
   return tai_holo_dispatch_tool ("ui_template_click", list);

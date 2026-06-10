@@ -13,6 +13,7 @@ from __future__ import annotations
 import atexit
 import base64
 import sys
+import threading
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -28,18 +29,33 @@ _app = FastMCP("tai-control-shell")
 # SikuliX bridge — lazy. The JVM subprocess is only spawned on first
 # screen_* / app_activate / ui_template_* call, so browser-only sessions
 # never pay the ~1.5 s JVM cold-start cost or the ~250 MB resident set.
+#
+# The double-checked-locking + local-binding pattern below handles two
+# hazards together:
+#   1. FastMCP can dispatch tools concurrently from its worker pool —
+#      two callers racing on `_bridge is None` without a lock would
+#      both spawn a JVM and leak the loser.
+#   2. The previous shape assigned `_bridge = BridgeClient()` BEFORE
+#      `.start()`, so a start() failure left a poisoned non-None
+#      singleton that later calls skipped past. Construct + start
+#      into a local first; only publish on success.
 # ---------------------------------------------------------------------------
 
 _bridge: BridgeClient | None = None
 _templates: TemplateStore | None = None
+_bridge_lock = threading.Lock()
+_templates_lock = threading.Lock()
 
 
 def _get_bridge() -> BridgeClient:
     global _bridge
     if _bridge is None:
-        _bridge = BridgeClient()
-        _bridge.start()
-        atexit.register(_bridge.stop)
+        with _bridge_lock:
+            if _bridge is None:
+                tmp = BridgeClient()
+                tmp.start()
+                atexit.register(tmp.stop)
+                _bridge = tmp
     return _bridge
 
 
@@ -48,7 +64,9 @@ def _get_templates() -> TemplateStore:
     which embedded/boot.c sets to ~/Library/Caches/tai/templates."""
     global _templates
     if _templates is None:
-        _templates = TemplateStore()
+        with _templates_lock:
+            if _templates is None:
+                _templates = TemplateStore()
     return _templates
 
 
@@ -306,18 +324,17 @@ def ui_template_find(
 
 @_app.tool(
     description=(
-        "Find a saved template and click its center. Raises if nothing "
-        "matches — clicking the wrong place is worse than a clear error."
+        "Find a saved template and click its center. Left-single-click "
+        "only — the underlying SikuliX bridge does not expose button or "
+        "click-count yet, so we omit them from the schema rather than "
+        "advertise params we silently discard. Raises if nothing matches."
     )
 )
 def ui_template_click(
     label: str,
     app: str | None = None,
     region: dict[str, int] | None = None,
-    button: str = "left",
-    clicks: int = 1,
 ) -> dict[str, Any]:
-    del button, clicks  # not yet wired through screen.click — left/single only
     match = ui_template_find(label, app, region=region)
     if match is None:
         app_norm = app or "_global"
