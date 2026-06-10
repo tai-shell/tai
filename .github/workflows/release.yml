@@ -159,6 +159,29 @@ jobs:
           cat /tmp/bad_pkgs.txt
           echo "::endgroup::"
 
+          # Install a wheel by unpacking into a fresh staging dir, then
+          # replacing each top-level entry in build/site-packages. Plain
+          # `pip install --target X --force-reinstall <whl>` does NOT
+          # overwrite existing files in X reliably (known pip-with-
+          # --target quirk), so we have to walk the wheel's top-level
+          # entries ourselves and `rm -rf` each before copying. Also
+          # handles the pure-Python-replacing-arch-specific case
+          # (websockets: pure wheel doesn't ship speedups.so, so the
+          # stale single-arch speedups.so needs to vanish too).
+          install_wheel_overlay() {
+            local whl=$1
+            local slug=$2
+            local stage="/tmp/fuse-install-${slug}"
+            rm -rf "$stage"
+            "${TAI_HOST_PYTHON}" -m pip install --no-deps --target "$stage" "$whl"
+            for entry in "$stage"/*; do
+              local name
+              name=$(basename "$entry")
+              rm -rf "build/site-packages/${name}"
+              cp -R "$entry" "build/site-packages/${name}"
+            done
+          }
+
           fuse_pkg() {
             local spec=$1
             local pkg_name=${spec%%==*}
@@ -179,8 +202,7 @@ jobs:
                          || true)
               if [ -n "$pure_whl" ]; then
                 echo "  → pure-Python: $(basename "$pure_whl")"
-                "${TAI_HOST_PYTHON}" -m pip install --force-reinstall --no-deps \
-                  --target build/site-packages "$pure_whl"
+                install_wheel_overlay "$pure_whl" "${slug}-pure"
                 return 0
               fi
             fi
@@ -209,8 +231,7 @@ jobs:
             "${TAI_HOST_PYTHON}" -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
             fused_whl=$(ls "$out_dir"/*.whl)
             echo "  → fused: $(basename "$fused_whl") (version $fuse_version)"
-            "${TAI_HOST_PYTHON}" -m pip install --force-reinstall --no-deps \
-              --target build/site-packages "$fused_whl"
+            install_wheel_overlay "$fused_whl" "${slug}-fused"
           }
 
           while read -r pkg; do
