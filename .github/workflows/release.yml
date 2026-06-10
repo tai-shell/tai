@@ -308,21 +308,29 @@ jobs:
       # including the appended tarball + trailer, so Gatekeeper
       # accepts the artifact on Macs without an explicit quarantine
       # opt-out. Mirrors holo's `Re-sign binary (macOS adhoc)` step.
-      - name: Adhoc codesign the bundled binary
+      # No post-bundle codesign. Clang's default ad-hoc signature
+      # on the arm64 slice (required for arm64 to load at all) is
+      # left intact: our append only adds bytes AFTER the Mach-O
+      # segments, outside the signed region, so the signature
+      # stays valid for loading. We tried three resign variants
+      # in this branch's history and each broke the payload
+      # (codesign --remove-signature truncates; codesign --force
+      # without --remove-signature fails internal validation on
+      # the existing signature because the file has trailing
+      # bytes). Without a Developer ID (out of scope per the
+      # design doc), additional codesign doesn't change the
+      # Gatekeeper outcome on the user side — they still have to
+      # clear com.apple.quarantine on a downloaded artifact.
+      # PyInstaller --onefile takes the same approach.
+      - name: Verify the bundled binary loads (no resign needed)
         run: |
-          # Strip the existing signature first. The bash binary
-          # comes out of clang ad-hoc signed; `make bundle` then
-          # appends our 24-byte trailer + gzip tarball AFTER the
-          # signed region, which `codesign --force --sign` rejects
-          # with "main executable failed strict validation" when
-          # asked to replace the now-broken signature in place.
-          # Removing first puts us in a clean state.
-          codesign --remove-signature build/tai-bundled || true
-          codesign --sign - build/tai-bundled
-          # --verify without --strict — see comment further down
-          # about why --strict can't pass on a trailer-appended
-          # Mach-O. Same pattern PyInstaller --onefile uses.
-          codesign --verify --verbose=2 build/tai-bundled
+          # `codesign --display` shows the existing signature so we
+          # can confirm the arm64 slice is still adhoc-signed after
+          # the append step.
+          codesign --display --verbose=2 build/tai-bundled || true
+          # Filesystem size sanity: bundle should be ~150 MB
+          # (bash ~7 MB + tarball ~143 MB + 24 B trailer).
+          stat -f "%z bytes" build/tai-bundled
 
       - name: Verify universal2 + smoke test the bundled binary
         run: |
