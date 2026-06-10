@@ -1,9 +1,26 @@
 name: Release
 
-# Tagged release workflow. On any push to a `v*` tag, build the tai
-# bash binary for each supported platform and publish a GitHub
-# Release with the assets attached. Tag PEP-440 pre-release suffixes
-# (a / b / rc) get marked as pre-releases automatically.
+# Tagged release workflow. On any push to a `v*` tag (or a manual
+# workflow_dispatch), build the bundled tai artifact for macOS
+# universal2 and publish a GitHub Release with the asset attached.
+# Tag PEP-440 pre-release suffixes (a / b / rc) get marked as
+# pre-releases automatically.
+#
+# Architecture: single artifact, single platform.
+#
+#   * Mac universal2 (arm64 + x86_64) only — pyobjc and the SikuliX
+#     bridge are macOS-specific, so the embedded-holo surface
+#     doesn't make sense on Linux/Windows. Cross-platform plain
+#     bash (without the embedded surface) would need a
+#     `--without-embedded-holo` configure flag; deferred to the
+#     `tai-slim` design doc item.
+#
+#   * One bundled binary, ~150 MB, all-inclusive. Drops the prior
+#     workflow's separate plain-bash artifacts — the bundled binary
+#     invoked under any non-tai argv[0] (e.g. `bash`, `sh`) is
+#     indistinguishable from upstream bash + the `@` operator, so
+#     the plain artifacts had no purchase the bundled doesn't
+#     already cover.
 
 on:
   push:
@@ -16,159 +33,322 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # One macOS build: universal2 (arm64 + x86_64 fat binary)
-          # on the Apple Silicon runner. We drove this in via plain
-          # `-arch' flags in CFLAGS+LDFLAGS — bash's autoconf does
-          # mostly preprocessor / link tests (arch-invariant on
-          # macOS) and the few AC_TRY_RUN probes execute the fat
-          # binary's arm64 slice on the build host. Apple has
-          # shipped bash as fat-binary in macOS for years, so the
-          # codebase is well-validated for this approach.
-          #
-          # Avoids the macos-13 (Intel) GHA runner queue starvation
-          # that was blocking releases.
-          - runner: macos-14
-            target: macos-universal2
-            artifact: tai-macos-universal2
-          - runner: ubuntu-latest
-            target: linux-x86_64
-            artifact: tai-linux-x86_64
-            builder: native
-          # musl build for Alpine-based environments (notably the
-          # c2w-net Docker container that the desktop SPA ships with).
-          # Built inside an alpine:3.19 container on the ubuntu runner
-          # so the resulting binary links against musl, not glibc.
-          - runner: ubuntu-latest
-            target: linux-x86_64-musl
-            artifact: tai-linux-x86_64-musl
-            builder: alpine
-
+    name: build (macOS universal2 bundled)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          # third_party/cpython is a submodule with our pinned 3.13.13
+          # source. Without `recursive` the embedded/Makefile cpython
+          # target fails immediately.
+          submodules: recursive
 
-      # macOS GitHub runners ship Apple's ancient `bison 2.3', which
-      # is too old to process bash 5.3's parse.y (it pre-dates the
-      # `YYEOF' token reference and bails with `symbol YYEOF is used,
-      # but is not defined as a token and has no rules'). Install
-      # Homebrew's modern bison and put it at the front of PATH.
-      - name: Install modern bison (macOS)
-        if: runner.os == 'macOS'
+      # macOS GitHub runners ship Apple's ancient `bison 2.3` which
+      # can't process bash 5.3's parse.y. Install Homebrew's modern
+      # bison and put it at the front of PATH.
+      - name: Install modern bison
         run: |
           brew install bison
           BISON_DIR="$(brew --prefix bison)/bin"
           echo "${BISON_DIR}" >> "$GITHUB_PATH"
           "${BISON_DIR}/bison" --version | head -1
 
-      - name: Verify bison version
-        if: matrix.builder != 'alpine'
-        run: bison --version | head -1
-
-      - name: Configure & build (native)
-        if: matrix.builder != 'alpine'
+      # actions/setup-python on macos-14 ships an arm64-only
+      # interpreter — building universal2 wheels via delocate
+      # requires that the HOST Python be universal2 so the
+      # site-packages discovery iterates both arches consistently.
+      # Use python.org's universal2 PKG installer (same approach
+      # holo uses) and pin to 3.13.x to match the embedded CPython
+      # ABI (cpython-313-darwin wheel tag is shared across all
+      # 3.13.* patch versions, so minor mismatch is fine).
+      - name: Install universal2 Python 3.13 from python.org
         run: |
-          # Force regen of the bison output. y.tab.c / y.tab.h
-          # are .gitignore'd as of fix/untrack-generated-y-tab,
-          # but if a future change re-tracks them (or this commit
-          # is rolled back), keep the build robust by deleting
-          # whatever's there before make.
+          PY_VER=3.13.5
+          curl -fsSL -o python-installer.pkg \
+            "https://www.python.org/ftp/python/${PY_VER}/python-${PY_VER}-macos11.pkg"
+          sudo installer -pkg python-installer.pkg -target /
+          PY_BIN=/Library/Frameworks/Python.framework/Versions/3.13/bin
+          echo "${PY_BIN}" >> "$GITHUB_PATH"
+          echo "TAI_HOST_PYTHON=${PY_BIN}/python3" >> "$GITHUB_ENV"
+          "${PY_BIN}/python3" --version
+          file "${PY_BIN}/python3"
+
+      # Capture the CPython submodule sha for cache keying. The
+      # static libpython3.13.a build is the slowest step (~5 min);
+      # caching it shaves the steady-state workflow time to ~3 min.
+      - name: Compute CPython submodule sha
+        id: cpython_sha
+        run: echo "sha=$(git -C third_party/cpython rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache CPython static build
+        id: cpython_cache
+        uses: actions/cache@v4
+        with:
+          path: build/cpython-install
+          # Bump the trailing version (-v1) to bust the cache when
+          # CPYTHON_CONFIGURE_FLAGS change in embedded/Makefile.
+          key: cpython-static-universal2-${{ steps.cpython_sha.outputs.sha }}-v1
+
+      - name: Build static CPython 3.13 (universal2)
+        if: steps.cpython_cache.outputs.cache-hit != 'true'
+        env:
+          TAI_UNIVERSAL2: "1"
+        run: |
+          make -C embedded cpython
+          # Sanity: libpython3.13.a should be universal2.
+          archs=$(lipo -archs build/cpython-install/lib/libpython3.13.a)
+          echo "libpython3.13.a archs: ${archs}"
+          case "${archs}" in
+            *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
+            *) echo "✗ expected universal2 libpython, got '${archs}'"; exit 1 ;;
+          esac
+
+      - name: Install pip deps into build/site-packages
+        run: make -C embedded deps HOST_PYTHON="${TAI_HOST_PYTHON}"
+
+      # Make every .so under build/site-packages universal2. Same
+      # algorithm as holo's release workflow: for each single-arch
+      # offender, try to swap in a pure-Python wheel (websockets
+      # ships one alongside its arm64 wheel), and if that's not
+      # available, fuse the arm64+x86_64 wheels via
+      # delocate-merge (delocate 0.13+). Required for pyobjc-
+      # framework-* and pydantic-core, both of which carry
+      # compiled extensions.
+      - name: Fuse single-arch native extensions to universal2
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          # PYTHONPATH so importlib.metadata picks up our build dir.
+          export PYTHONPATH="$PWD/build/site-packages:${PYTHONPATH:-}"
+          "${TAI_HOST_PYTHON}" -m pip install --upgrade delocate
+          mkdir -p /tmp/wheels
+
+          "${TAI_HOST_PYTHON}" > /tmp/bad_pkgs.txt <<'PY'
+          import os, subprocess
+          from importlib.metadata import distributions
+
+          bad = {}
+          for dist in distributions():
+              name = dist.metadata["Name"]
+              version = dist.version
+              for f in (dist.files or []):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if not ("arm64" in archs and "x86_64" in archs):
+                      bad[name] = version
+                      break
+          for n, v in sorted(bad.items()):
+              print(f"{n}=={v}")
+          PY
+
+          echo "::group::offenders"
+          cat /tmp/bad_pkgs.txt
+          echo "::endgroup::"
+
+          fuse_pkg() {
+            local spec=$1
+            local pkg_name=${spec%%==*}
+            local slug=${spec//[^A-Za-z0-9]/_}
+            local arm_dir="/tmp/wheels/${slug}-arm64"
+            local x86_dir="/tmp/wheels/${slug}-x86"
+            local out_dir="/tmp/wheels/${slug}-out"
+            rm -rf "$arm_dir" "$x86_dir" "$out_dir"
+            mkdir -p "$arm_dir" "$x86_dir" "$out_dir"
+
+            # Pure-Python wheel first (websockets path).
+            if "${TAI_HOST_PYTHON}" -m pip download --no-deps --only-binary=:all: \
+                 --platform any --python-version 3.13 \
+                 --dest "$out_dir" "$spec" >/dev/null 2>&1; then
+              local pure_whl
+              pure_whl=$(ls "$out_dir"/*-py3-none-any.whl 2>/dev/null \
+                         || ls "$out_dir"/*-py2.py3-none-any.whl 2>/dev/null \
+                         || true)
+              if [ -n "$pure_whl" ]; then
+                echo "  → pure-Python: $(basename "$pure_whl")"
+                "${TAI_HOST_PYTHON}" -m pip install --force-reinstall --no-deps \
+                  --target build/site-packages "$pure_whl"
+                return 0
+              fi
+            fi
+
+            # Fuse arm64+x86_64 wheels via delocate-merge. If x86_64
+            # has no wheel at the pinned version (cffi 2.0.0 etc),
+            # fall back to whatever version still has both arches.
+            rm -rf "$out_dir"; mkdir -p "$out_dir"
+            if ! "${TAI_HOST_PYTHON}" -m pip download --no-deps --only-binary=:all: \
+                   --platform macosx_10_12_x86_64 --python-version 3.13 \
+                   --dest "$x86_dir" "$spec" 2>/dev/null; then
+              echo "  ! no x86_64 wheel for $spec — falling back to latest"
+              rm -rf "$x86_dir"; mkdir -p "$x86_dir"
+              "${TAI_HOST_PYTHON}" -m pip download --no-deps --only-binary=:all: \
+                --platform macosx_10_12_x86_64 --python-version 3.13 \
+                --dest "$x86_dir" "$pkg_name"
+            fi
+            local x86_whl fuse_version
+            x86_whl=$(ls "$x86_dir"/*.whl)
+            fuse_version=$(basename "$x86_whl" | awk -F- '{print $2}')
+            "${TAI_HOST_PYTHON}" -m pip download --no-deps --only-binary=:all: \
+              --platform macosx_11_0_arm64 --python-version 3.13 \
+              --dest "$arm_dir" "${pkg_name}==${fuse_version}"
+            local arm_whl fused_whl
+            arm_whl=$(ls "$arm_dir"/*.whl)
+            "${TAI_HOST_PYTHON}" -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
+            fused_whl=$(ls "$out_dir"/*.whl)
+            echo "  → fused: $(basename "$fused_whl") (version $fuse_version)"
+            "${TAI_HOST_PYTHON}" -m pip install --force-reinstall --no-deps \
+              --target build/site-packages "$fused_whl"
+          }
+
+          while read -r pkg; do
+            [ -z "$pkg" ] && continue
+            echo "::group::fuse $pkg"
+            fuse_pkg "$pkg"
+            echo "::endgroup::"
+          done < /tmp/bad_pkgs.txt
+
+          # Final verification scan.
+          echo "::group::verify universal2"
+          "${TAI_HOST_PYTHON}" <<'PY'
+          import os, subprocess, sys
+          from importlib.metadata import distributions
+
+          bad = []
+          for dist in distributions():
+              for f in (dist.files or []):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if "arm64" in archs and "x86_64" in archs:
+                      print(f"OK {full} ({archs})")
+                  else:
+                      bad.append((full, archs))
+                      print(f"BAD {full} ({archs})")
+          if bad:
+              print(f"\n{len(bad)} single-arch .so still present", file=sys.stderr)
+              sys.exit(1)
+          PY
+          echo "::endgroup::"
+
+      - name: Download SikuliX jar
+        run: make -C embedded sikuli-jar
+
+      # Top-level bash build: pass -arch flags so the linker
+      # produces a universal2 Mach-O. libpython3.13.a built above
+      # is universal2, the EMBED_LIBS link line picks it up.
+      - name: Configure & build bash (universal2)
+        run: |
+          # Force regen of bison output (mirrors the comment in the
+          # prior workflow about untracked y.tab.c).
           rm -f y.tab.c y.tab.h
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            # Universal2: pass -arch flags through CFLAGS+LDFLAGS.
-            # Apple's clang builds fat .o files; the linker produces
-            # a fat binary directly. min-version 11.0 is the highest
-            # arm64 deployment target supported and works for x86_64
-            # too (Big Sur+).
-            export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2"
-            export LDFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
-            ./configure --quiet
-            make -j$(sysctl -n hw.ncpu)
-          else
-            ./configure --quiet
-            make -j$(nproc)
-          fi
-          ls -la bash
+          export CFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2"
+          export LDFLAGS="-arch arm64 -arch x86_64 -mmacosx-version-min=11.0"
+          ./configure --quiet
+          make -j$(sysctl -n hw.ncpu)
+          archs=$(lipo -archs bash)
+          echo "bash archs: ${archs}"
+          case "${archs}" in
+            *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 bash confirmed" ;;
+            *) echo "✗ expected universal2 bash, got '${archs}'"; exit 1 ;;
+          esac
 
-      # Build inside an alpine container so the resulting binary
-      # links against musl libc — required for the desktop SPA's
-      # c2w-net container (Alpine 3.19) and the WASM VM that ships
-      # with it. Image cache lets the apk add complete in seconds
-      # on subsequent runs.
-      #
-      # `touch configure aclocal.m4 configure.ac' nudges the
-      # mtime ordering so autotools-generated Makefile rules don't
-      # try to regenerate `configure' from `configure.ac' (which
-      # would require autoconf — bash 5.3 ships a working
-      # configure, no regeneration needed). Without this, fresh
-      # checkout timestamps occasionally land in the wrong order
-      # and `make' fails with `autoconf: not found'.
-      - name: Configure & build (alpine/musl)
-        if: matrix.builder == 'alpine'
+      - name: Append payload + trailer (make bundle)
+        run: make -C embedded bundle
+
+      # Mach-O code signature is invalidated by the appended payload,
+      # so the binary needs to be (re)signed AFTER the bundle step.
+      # Adhoc signature (--sign -) covers all bytes of the file
+      # including the appended tarball + trailer, so Gatekeeper
+      # accepts the artifact on Macs without an explicit quarantine
+      # opt-out. Mirrors holo's `Re-sign binary (macOS adhoc)` step.
+      - name: Adhoc codesign the bundled binary
         run: |
-          # `--without-bash-malloc' is required on musl: bash's
-          # bundled malloc (lib/malloc/malloc.c) makes platform
-          # assumptions that aren't met on musl, and the resulting
-          # binary aborts with `xmalloc: locale.c:90: cannot
-          # allocate 18 bytes' as soon as setlocale() runs. Using
-          # the system (musl) malloc avoids the issue cleanly.
-          docker run --rm \
-            -v "$PWD":/src -w /src \
-            --platform linux/amd64 \
-            alpine:3.19 sh -c '
-              set -e
-              apk add --no-cache build-base bison
-              touch aclocal.m4 configure.ac configure
-              # Force regen of bison output (see comment in
-              # native build step).
-              rm -f y.tab.c y.tab.h
-              ./configure --quiet --without-bash-malloc
-              make -j$(nproc)
-              ls -la bash
-            '
+          codesign --force --deep --sign - build/tai-bundled
+          codesign --verify --deep --strict --verbose=2 build/tai-bundled
 
-      - name: Stage artifact
+      - name: Verify universal2 + smoke test the bundled binary
+        run: |
+          archs=$(lipo -archs build/tai-bundled)
+          echo "tai-bundled archs: ${archs}"
+          case "${archs}" in
+            *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
+            *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
+          esac
+
+          # Drive an MCP initialize+tools/list against the freshly-
+          # built binary invoked under the tcsh name. Counts 25
+          # tools — the design-doc surface.
+          ln -sf "$PWD/build/tai-bundled" /tmp/tcsh
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0.1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | /tmp/tcsh > /tmp/ci-out.jsonl 2> /tmp/ci-stderr.log || true
+          echo "::group::smoke stderr"
+          cat /tmp/ci-stderr.log
+          echo "::endgroup::"
+          "${TAI_HOST_PYTHON}" - <<'PY'
+          import json, sys
+          tools = None
+          with open("/tmp/ci-out.jsonl") as f:
+              for line in f:
+                  if not line.strip().startswith("{"):
+                      continue
+                  msg = json.loads(line)
+                  if msg.get("id") == 2:
+                      tools = msg["result"]["tools"]
+          if tools is None:
+              print("FAIL: no tools/list response", file=sys.stderr)
+              sys.exit(1)
+          print(f"tools: {len(tools)}")
+          if len(tools) != 25:
+              print(f"FAIL: expected 25 tools, got {len(tools)}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Stage release artifact
         run: |
           mkdir -p out
-          cp bash "out/${{ matrix.artifact }}"
-          chmod +x "out/${{ matrix.artifact }}"
-          file "out/${{ matrix.artifact }}"
-          # Universal2 sanity check: lipo should report both arches.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            archs=$(lipo -archs "out/${{ matrix.artifact }}")
-            echo "lipo archs: ${archs}"
-            case "${archs}" in
-              *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
-              *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
-            esac
-          fi
-          # Smoke tests. The musl build links against
-          # /lib/ld-musl-x86_64.so.1 — only present in Alpine, so
-          # run those tests inside the same alpine container we
-          # built in. Native (glibc / Mach-O) artifacts run on the
-          # host runner directly.
-          if [ "${{ matrix.builder }}" = "alpine" ]; then
-            docker run --rm \
-              -v "$PWD/out":/out -w /out \
-              --platform linux/amd64 \
-              alpine:3.19 sh -c '
-                "./${{ matrix.artifact }}" --version
-                "./${{ matrix.artifact }}" -c "echo 1+1=\$((1+1)); for i in 1 2 3; do echo iter \$i; done"
-              '
-          else
-            "./out/${{ matrix.artifact }}" --version
-            "./out/${{ matrix.artifact }}" -c 'echo 1+1=$((1+1)); for i in 1 2 3; do echo iter $i; done'
-          fi
+          cp build/tai-bundled out/tai-bundled-macos-universal2
+          chmod +x out/tai-bundled-macos-universal2
+          ls -la out/
+          shasum -a 256 out/tai-bundled-macos-universal2 \
+            > out/tai-bundled-macos-universal2.sha256
+          cat out/tai-bundled-macos-universal2.sha256
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: out/${{ matrix.artifact }}
+          name: tai-bundled-macos-universal2
+          path: |
+            out/tai-bundled-macos-universal2
+            out/tai-bundled-macos-universal2.sha256
           if-no-files-found: error
           retention-days: 14
 

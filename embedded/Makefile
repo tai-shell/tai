@@ -43,6 +43,15 @@ CPYTHON_CONFIGURE_FLAGS := \
 ifeq ($(CPYTHON_OPT),1)
 CPYTHON_CONFIGURE_FLAGS += --enable-optimizations --with-lto
 endif
+# Universal2 (arm64 + x86_64 fat) build of libpython3.13.a. Required
+# when the resulting binary is itself going to be linked as
+# universal2 — the release CI sets this. Apple Silicon hosts cross-
+# compile the x86_64 slice via Apple's bundled SDK.
+ifeq ($(TAI_UNIVERSAL2),1)
+CPYTHON_CONFIGURE_FLAGS += \
+    --enable-universalsdk=/ \
+    --with-universal-archs=universal2
+endif
 
 # Job count for the CPython build.
 NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
