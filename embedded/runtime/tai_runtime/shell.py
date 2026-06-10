@@ -23,8 +23,15 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import types
 import typing
 from typing import Any
+
+# PEP 604 unions (X | None) get_origin to types.UnionType. PEP 484
+# unions (Optional[X]) get_origin to typing.Union. Treat them the
+# same — both flatten to the underlying X when None is the only
+# alternative.
+_UNION_ORIGINS = (typing.Union, types.UnionType)
 
 from tai_runtime import server
 
@@ -36,10 +43,11 @@ def _coerce(value: str, annotation: Any) -> Any:
         return value
     # Strip Optional[...] / X | None
     origin = typing.get_origin(annotation)
-    if origin is typing.Union:
+    if origin in _UNION_ORIGINS:
         args = [a for a in typing.get_args(annotation) if a is not type(None)]
         if len(args) == 1:
             annotation = args[0]
+            origin = typing.get_origin(annotation)
     if annotation is str:
         return value
     if annotation is int:
@@ -53,6 +61,14 @@ def _coerce(value: str, annotation: Any) -> Any:
         if low in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"can't parse {value!r} as bool")
+    # dict / list / nested structure -> JSON-decode the string. Lets a
+    # shell user pass things like `screen_shot '{"x":0,...}'` without
+    # giving up the typed Python API.
+    if annotation is dict or origin is dict or annotation is list or origin is list:
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"expected JSON {annotation}, got {value!r}: {e}") from e
     return value
 
 
@@ -82,9 +98,12 @@ def dispatch(tool_name: str, str_args: list[str]) -> int:
         return 2
 
     try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        print(f"holo: cannot introspect {tool_name}", file=sys.stderr)
+        # eval_str=True so `from __future__ import annotations` in
+        # server.py doesn't leave annotations as bare strings —
+        # _coerce needs real type objects to dispatch correctly.
+        sig = inspect.signature(fn, eval_str=True)
+    except (TypeError, ValueError, NameError) as e:
+        print(f"holo: cannot introspect {tool_name}: {e}", file=sys.stderr)
         return 2
 
     params = list(sig.parameters.values())
