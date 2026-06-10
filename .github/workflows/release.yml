@@ -73,9 +73,77 @@ jobs:
           "${PY_BIN}/python3" --version
           file "${PY_BIN}/python3"
 
-      # Capture the CPython submodule sha for cache keying. The
-      # static libpython3.13.a build is the slowest step (~5 min);
-      # caching it shaves the steady-state workflow time to ~3 min.
+      # Pin OpenSSL version; bumping it busts both the OpenSSL and
+      # CPython caches and forces a clean rebuild end-to-end.
+      - name: Set OpenSSL version
+        id: openssl_pin
+        run: echo "version=3.4.0" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OpenSSL universal2 build
+        id: openssl_cache
+        uses: actions/cache@v4
+        with:
+          path: build/openssl-install
+          key: openssl-universal2-${{ steps.openssl_pin.outputs.version }}-v1
+
+      # Build OpenSSL universal2 by compiling for each arch into a
+      # per-arch prefix, then lipo-ing the resulting static libs
+      # (libssl.a, libcrypto.a) into a single universal2 install.
+      # Headers come from the arm64 build (they're identical across
+      # arches). Required because (a) Homebrew's openssl is single-
+      # arch, (b) CPython's _ssl C extension links statically against
+      # OpenSSL at CPython build time, and (c) without _ssl, anyio
+      # (transitive dep of mcp) crashes on import.
+      - name: Build OpenSSL universal2
+        if: steps.openssl_cache.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ steps.openssl_pin.outputs.version }}"
+          SRC=/tmp/openssl-src
+          ARM_PFX=/tmp/openssl-arm64
+          X86_PFX=/tmp/openssl-x86_64
+          OUT="$PWD/build/openssl-install"
+
+          rm -rf "$SRC" "$ARM_PFX" "$X86_PFX" "$OUT"
+          mkdir -p "$SRC" "$OUT/lib" "$OUT/include"
+
+          curl -fsSL -o /tmp/openssl.tar.gz \
+            "https://www.openssl.org/source/openssl-${VER}.tar.gz"
+          tar xzf /tmp/openssl.tar.gz -C "$SRC" --strip-components=1
+
+          # arm64 slice
+          (cd "$SRC" && \
+            ./Configure darwin64-arm64-cc no-shared no-tests \
+              --prefix="$ARM_PFX" \
+              -mmacosx-version-min=11.0 && \
+            make -j$(sysctl -n hw.ncpu) >/dev/null && \
+            make install_sw >/dev/null && \
+            make clean >/dev/null)
+
+          # x86_64 slice
+          (cd "$SRC" && \
+            ./Configure darwin64-x86_64-cc no-shared no-tests \
+              --prefix="$X86_PFX" \
+              -mmacosx-version-min=11.0 && \
+            make -j$(sysctl -n hw.ncpu) >/dev/null && \
+            make install_sw >/dev/null)
+
+          # Lipo the static libs together; headers from arm64 slice.
+          cp -R "$ARM_PFX/include/." "$OUT/include/"
+          for lib in libssl libcrypto; do
+            lipo -create "$ARM_PFX/lib/${lib}.a" "$X86_PFX/lib/${lib}.a" \
+                 -output "$OUT/lib/${lib}.a"
+            archs=$(lipo -archs "$OUT/lib/${lib}.a")
+            echo "$lib archs: ${archs}"
+            case "${archs}" in
+              *arm64*x86_64*|*x86_64*arm64*) echo "  ✓ universal2" ;;
+              *) echo "  ✗ expected universal2, got '${archs}'"; exit 1 ;;
+            esac
+          done
+
+      # Capture the CPython submodule sha for cache keying. Cache
+      # key also includes the OpenSSL version so a OpenSSL bump
+      # busts the CPython cache and forces a rebuild with the new
+      # _ssl link.
       - name: Compute CPython submodule sha
         id: cpython_sha
         run: echo "sha=$(git -C third_party/cpython rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -85,15 +153,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/cpython-install
-          # Bump the trailing version (-v1) to bust the cache when
-          # CPYTHON_CONFIGURE_FLAGS change in embedded/Makefile.
-          key: cpython-static-universal2-${{ steps.cpython_sha.outputs.sha }}-v1
+          # -v2 (was -v1): bump on CPYTHON_CONFIGURE_FLAGS changes
+          # in embedded/Makefile. Including the OpenSSL version
+          # too because _ssl is linked against it.
+          key: cpython-static-universal2-${{ steps.cpython_sha.outputs.sha }}-openssl-${{ steps.openssl_pin.outputs.version }}-v2
 
-      - name: Build static CPython 3.13 (universal2)
+      - name: Build static CPython 3.13 (universal2 + _ssl)
         if: steps.cpython_cache.outputs.cache-hit != 'true'
         env:
           TAI_UNIVERSAL2: "1"
         run: |
+          export TAI_OPENSSL_PREFIX="$PWD/build/openssl-install"
           make -C embedded cpython
           # Sanity: libpython3.13.a should be universal2.
           archs=$(lipo -archs build/cpython-install/lib/libpython3.13.a)
@@ -101,6 +171,20 @@ jobs:
           case "${archs}" in
             *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
             *) echo "✗ expected universal2 libpython, got '${archs}'"; exit 1 ;;
+          esac
+          # Sanity: _ssl module should have been built and be
+          # universal2. Path depends on whether CPython produces a
+          # framework-style install; check the standard locations.
+          ssl_so=$(find build/cpython-install -name "_ssl*.so" -type f | head -1)
+          if [ -z "$ssl_so" ]; then
+            echo "✗ _ssl module missing from cpython-install"
+            exit 1
+          fi
+          archs=$(lipo -archs "$ssl_so")
+          echo "$(basename "$ssl_so") archs: ${archs}"
+          case "${archs}" in
+            *arm64*x86_64*|*x86_64*arm64*) echo "✓ _ssl universal2 confirmed" ;;
+            *) echo "✗ expected universal2 _ssl, got '${archs}'"; exit 1 ;;
           esac
 
       - name: Install pip deps into build/site-packages
