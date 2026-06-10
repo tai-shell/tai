@@ -17,6 +17,7 @@
    and old caches stay intact (rollback is a `cp` away). */
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -94,6 +95,60 @@ mkdir_p (const char *path)
   if (mkdir (buf, 0755) != 0 && errno != EEXIST)
     return -1;
   return 0;
+}
+
+/* Sweep stale `payload-<key>.tmp-<pid>` dirs in `cache_root` whose
+   pids are no longer alive. Each first-launch extraction creates a
+   per-pid temp dir; on a crash the dir is orphaned and never picked
+   up by a future run (which gets a different pid). Without this
+   sweep, ~/Library/Caches/tai/ accumulates them. We probe each
+   suspected pid with kill(pid, 0): ESRCH means the process is
+   gone; any other result means it might still be a concurrent
+   extractor and we leave it alone.
+
+   PID reuse can mask a stale dir behind a live unrelated process,
+   but the next sweep (when that unrelated process exits) catches
+   it. Acceptable for a janitor. */
+static void rm_rf (const char *path);    /* forward decl */
+static void
+sweep_stale_tmp_dirs (const char *cache_root, const char *key)
+{
+  DIR *d = opendir (cache_root);
+  if (d == NULL)
+    return;
+  char prefix[NAME_MAX];
+  int plen = snprintf (prefix, sizeof prefix, "payload-%s.tmp-", key);
+  if (plen <= 0 || (size_t) plen >= sizeof prefix)
+    {
+      closedir (d);
+      return;
+    }
+
+  struct dirent *e;
+  while ((e = readdir (d)) != NULL)
+    {
+      if (strncmp (e->d_name, prefix, (size_t) plen) != 0)
+	continue;
+      const char *pid_str = e->d_name + plen;
+      char *endptr = NULL;
+      errno = 0;
+      long pid = strtol (pid_str, &endptr, 10);
+      if (errno != 0 || endptr == pid_str || *endptr != '\0' || pid <= 0)
+	continue;
+
+      /* kill(pid, 0) returns 0 if the process exists (any uid), or
+	 -1 with errno=ESRCH if it doesn't. EPERM means it exists but
+	 we can't signal it — treat as live to be safe. */
+      if (kill ((pid_t) pid, 0) == 0)
+	continue;
+      if (errno != ESRCH)
+	continue;
+
+      char path[PATH_MAX];
+      snprintf (path, sizeof path, "%s/%s", cache_root, e->d_name);
+      rm_rf (path);
+    }
+  closedir (d);
 }
 
 /* Recursively remove a directory tree. Used on extraction failure to
@@ -239,13 +294,13 @@ tai_payload_ensure_extracted (const char *exe_path,
       return -1;
     }
 
+  /* Sweep orphaned temp dirs from prior crashed runs (any pid that's
+     no longer alive). Bounded — typically zero, occasionally one. */
+  sweep_stale_tmp_dirs (cache_root, key);
+
   char tmp_dir[PATH_MAX];
   snprintf (tmp_dir, sizeof tmp_dir,
 	    "%s.tmp-%d", cache_dir, (int) getpid ());
-
-  /* Wipe any stale temp from a previous crashed run with the same
-     pid (unlikely but possible). */
-  rm_rf (tmp_dir);
   if (mkdir (tmp_dir, 0755) != 0)
     {
       fprintf (stderr, "tai: mkdir %s failed: %s\n",

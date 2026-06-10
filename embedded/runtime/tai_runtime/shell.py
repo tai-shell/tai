@@ -69,6 +69,11 @@ def _coerce(value: str, annotation: Any) -> Any:
             return json.loads(value)
         except json.JSONDecodeError as e:
             raise ValueError(f"expected JSON {annotation}, got {value!r}: {e}") from e
+    # Fallthrough: anything outside (str, int, float, bool, dict, list) —
+    # typing.Literal, typing.TypeAlias, custom classes, etc. — gets passed
+    # through as the raw string. Fine for the current 25-tool surface
+    # (none use those types). Revisit if a tool grows e.g. a Literal
+    # enum param where the caller expects pre-validation here.
     return value
 
 

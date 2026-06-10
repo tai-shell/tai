@@ -31,10 +31,12 @@
 #define TAI_PAYLOAD_MAGIC_LEN  7
 #define TAI_PAYLOAD_VERSION    1
 
-/* Total size on disk: exactly 24 bytes. The 8 reserved bytes round
-   the trailer up to a multiple of 8 for any aligned-fetch tooling
-   and leave room to add a sha256 of the payload later without
-   changing the trailer size. */
+/* Total size on disk: exactly 24 bytes. The magic + version pair
+   (8 bytes) and the two uint64 fields (16 bytes) leave no padding
+   under __attribute__((packed)). If you grow the struct (e.g. add
+   a sha256 of the payload contents), bump TAI_PAYLOAD_VERSION and
+   update tai_payload_read_trailer in payload.c so a v1 binary
+   still rejects a v2 trailer cleanly. */
 typedef struct {
   char     magic[TAI_PAYLOAD_MAGIC_LEN]; /*  7  "TAIPYLD" no terminator */
   uint8_t  version;			 /*  1  TAI_PAYLOAD_VERSION    */
