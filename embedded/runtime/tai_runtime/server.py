@@ -12,9 +12,53 @@ from __future__ import annotations
 
 import atexit
 import base64
+import os
 import sys
 import threading
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Workaround for CPython embedded-interpreter env-var visibility.
+#
+# embedded/boot.c does `setenv("HOLO_SIKULI_JAR", ...)` BEFORE
+# Py_InitializeFromConfig so vendored holo's `os.environ.get(...)`
+# lookups would see them. But CPython's posix module imports its
+# `environ` snapshot at a point that, when we're embedded inside
+# bash, doesn't reflect our pre-Py-init setenv calls — leaving
+# HOLO_SIKULI_JAR / HOLO_BRIDGE_SCRIPT / HOLO_TEMPLATE_DIR invisible
+# to anything reading them via os.environ.
+#
+# The values are in libc's environ (verified via ctypes getenv), so
+# we backfill os.environ at import time before any holo module
+# does its env-var reads. This has to happen BEFORE the
+# `from holo.bridge import BridgeClient` line below or it's too
+# late — BridgeClient reads the env at class-definition time.
+# ---------------------------------------------------------------------------
+
+
+def _backfill_env_from_libc() -> None:
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None)
+        libc.getenv.restype = ctypes.c_char_p
+        libc.getenv.argtypes = [ctypes.c_char_p]
+    except OSError:
+        return
+    for name in (
+        "HOLO_SIKULI_JAR",
+        "HOLO_BRIDGE_SCRIPT",
+        "HOLO_TEMPLATE_DIR",
+    ):
+        if name in os.environ:
+            continue
+        raw = libc.getenv(name.encode())
+        if raw is not None:
+            os.environ[name] = raw.decode()
+
+
+_backfill_env_from_libc()
+
 
 from mcp.server.fastmcp import FastMCP
 
@@ -229,6 +273,253 @@ def screen_user_capture(
 ) -> dict[str, Any]:
     """Run the interactive drag-rectangle capture; return the dragged rect's PNG."""
     return _get_bridge().user_capture(prompt=prompt, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# doctor — runtime/permissions/environment diagnostic
+# ---------------------------------------------------------------------------
+
+
+@_app.tool(
+    description=(
+        "Diagnose the tai/tcsh runtime: Java, SikuliX bridge, "
+        "Screen Recording (via window-title readability), the TCC "
+        "responsible-process chain, and bundle-vs-dev-tree state. "
+        "Does NOT start the JVM bridge (cheap to run). Returns a dict; "
+        "use `holo doctor | jq` to read it from the shell."
+    )
+)
+def doctor() -> dict[str, Any]:
+    return _run_doctor()
+
+
+def _run_doctor() -> dict[str, Any]:
+    import os
+    import platform
+    import shutil
+    import subprocess
+    from importlib.metadata import version as _v
+
+    result: dict[str, Any] = {}
+
+    # Runtime / platform
+    result["platform"] = {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "release": platform.mac_ver()[0] if sys.platform == "darwin" else None,
+    }
+    result["python"] = {
+        "version": sys.version.split()[0],
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+    }
+    result["process"] = {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "argv0": sys.argv[0] if sys.argv else None,
+    }
+
+    # The three HOLO_* env vars boot.c set up — confirm they point
+    # at extant files. The libc-backfill at import time above makes
+    # these visible via os.environ.
+    result["env"] = {
+        name: _check_path(os.environ.get(name))
+        for name in ("HOLO_SIKULI_JAR", "HOLO_BRIDGE_SCRIPT", "HOLO_TEMPLATE_DIR")
+    }
+
+    # Java — top failure mode on a fresh macOS install.
+    result["java"] = _check_java()
+
+    # TCC chain: walk the parent pid up. macOS attributes
+    # Accessibility / Screen Recording permissions to the
+    # responsible process up the launch chain — usually an .app
+    # ancestor (Terminal.app, iTerm.app, etc.), NOT the binary
+    # itself. Adding tai to Accessibility doesn't help if the
+    # ancestor is what TCC is checking against.
+    result["tcc_chain"] = _walk_tcc_chain()
+
+    # Screen Recording probe: count visible windows and how many
+    # have readable titles. Without Screen Recording, browser
+    # window titles read as empty. Mirrors holo's check.
+    result["screen_recording"] = _check_window_listing()
+
+    # Bundled-payload state: which mode, which cache.
+    result["payload"] = _check_payload_state()
+
+    # MCP framework version, holo subtree version.
+    result["versions"] = {
+        "holo": _safe(lambda: __import__("holo").__version__),
+        "mcp": _safe(lambda: _v("mcp")),
+    }
+
+    # Verdict — short human-readable summary
+    result["summary"] = _summarize(result)
+    return result
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception as e:
+        return f"<error: {e}>"
+
+
+def _check_path(p: str | None) -> dict[str, Any]:
+    if p is None:
+        return {"set": False}
+    import os
+    return {
+        "set": True,
+        "value": p,
+        "exists": os.path.exists(p),
+        "size_bytes": (os.path.getsize(p) if os.path.isfile(p) else None),
+    }
+
+
+def _check_java() -> dict[str, Any]:
+    import shutil
+    import subprocess
+
+    java = shutil.which("java")
+    if not java:
+        return {
+            "available": False,
+            "hint": (
+                "Java is required for SikuliX (screen_*, ui_template_*, "
+                "app_activate). Install with `brew install openjdk` and "
+                "follow the post-install symlink hint brew prints. On a "
+                "fresh Mac this is the most common cause of screen_* "
+                "failures."
+            ),
+        }
+    try:
+        proc = subprocess.run(
+            [java, "-version"], capture_output=True, text=True, timeout=5,
+        )
+        version = (proc.stderr or proc.stdout).strip().split("\n")[0]
+        return {"available": True, "path": java, "version": version}
+    except Exception as e:
+        return {"available": True, "path": java, "version_error": str(e)}
+
+
+def _walk_tcc_chain() -> dict[str, Any]:
+    import os
+    import subprocess
+
+    chain = []
+    current_pid = os.getppid()
+    for _ in range(20):
+        if current_pid <= 1:
+            break
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "pid=,ppid=,comm=", "-p", str(current_pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+            line = (proc.stdout or "").strip()
+            if not line:
+                break
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                break
+            pid_s, ppid_s, comm = parts[0], parts[1], parts[2]
+            chain.append({"pid": int(pid_s), "name": comm})
+            current_pid = int(ppid_s)
+        except Exception:
+            break
+
+    likely = None
+    for entry in chain:
+        name = entry["name"]
+        if ".app/" in name or name.endswith(".app"):
+            likely = name
+            break
+
+    return {
+        "chain": chain,
+        "likely_tcc_responsible": likely,
+        "hint": (
+            f"macOS TCC attributes Accessibility/Screen Recording to the "
+            f"responsible process up the launch chain — likely "
+            f"`{likely}` here, NOT tai/tcsh. Grant THAT app the "
+            f"permissions if screen_* tools fail at the TCC layer."
+            if likely else
+            "No .app ancestor found in the process chain (e.g., launched "
+            "via ssh or cron). macOS may attribute permissions to the "
+            "binary itself; check System Settings for entries matching "
+            "`tai`/`tcsh`."
+        ),
+    }
+
+
+def _check_window_listing() -> dict[str, Any]:
+    try:
+        from Quartz import (  # type: ignore[import-untyped]
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+        )
+    except Exception as e:
+        return {"queryable": False, "error": f"Quartz import failed: {e}"}
+    try:
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
+        )
+    except Exception as e:
+        return {"queryable": True, "error": f"CGWindowListCopyWindowInfo failed: {e}"}
+
+    total = len(windows)
+    with_title = sum(1 for w in windows if w.get("kCGWindowName"))
+    return {
+        "queryable": True,
+        "visible_windows": total,
+        "with_readable_titles": with_title,
+        "hint": (
+            "Screen Recording permission appears granted "
+            "(>=3 windows have readable titles)."
+            if with_title >= 3 else
+            "Few/no readable window titles — Screen Recording is "
+            "likely DENIED for the responsible process. See tcc_chain."
+        ),
+    }
+
+
+def _check_payload_state() -> dict[str, Any]:
+    import os
+    from pathlib import Path
+
+    home = os.environ.get("HOME", "")
+    cache_root = Path(home) / "Library" / "Caches" / "tai"
+    caches = []
+    if cache_root.exists():
+        for p in sorted(cache_root.glob("payload-*")):
+            if p.is_dir() and not p.name.endswith(".tmp-" + str(os.getpid())):
+                stamp = p / ".stamp"
+                caches.append({
+                    "dir": str(p),
+                    "ready": stamp.exists(),
+                })
+    return {"cache_root": str(cache_root), "extracted_caches": caches}
+
+
+def _summarize(result: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if not result["java"].get("available"):
+        issues.append("Java is missing — install with `brew install openjdk`.")
+    sr = result["screen_recording"]
+    if sr.get("queryable") and sr.get("with_readable_titles", 0) < 3:
+        issues.append(
+            "Screen Recording permission appears denied for the TCC "
+            "responsible process."
+        )
+    # The SikuliX jar + bridge script are read-only prerequisites:
+    # if they're missing, the bundle's broken. HOLO_TEMPLATE_DIR is
+    # a write-on-demand cache so non-existence at startup is fine.
+    for name in ("HOLO_SIKULI_JAR", "HOLO_BRIDGE_SCRIPT"):
+        info = result["env"].get(name, {})
+        if info.get("set") and not info.get("exists"):
+            issues.append(f"{name} points at a missing path: {info.get('value')}")
+    return issues or ["All baseline checks pass."]
 
 
 # ---------------------------------------------------------------------------
