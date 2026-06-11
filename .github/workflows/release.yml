@@ -450,9 +450,28 @@ jobs:
           if tools is None:
               print("FAIL: no tools/list response", file=sys.stderr)
               sys.exit(1)
+          names = sorted(t["name"] for t in tools)
           print(f"tools: {len(tools)}")
-          if len(tools) != 25:
-              print(f"FAIL: expected 25 tools, got {len(tools)}", file=sys.stderr)
+          # Sanity-check the surface: every expected family member
+          # must be present. Counts can grow (e.g. `doctor` added
+          # in #22 → 26); use a name-based check so the assertion
+          # isn't brittle to additions.
+          required_prefixes = ("browser_", "screen_", "ui_template_")
+          required_exact = {"app_activate", "doctor", "holo"}  # holo not registered as a tool
+          missing = []
+          for prefix in required_prefixes:
+              if not any(n.startswith(prefix) for n in names):
+                  missing.append(f"no {prefix}* tools")
+          for exact in {"app_activate", "doctor"}:
+              if exact not in names:
+                  missing.append(f"missing tool: {exact}")
+          if missing:
+              print("FAIL: " + "; ".join(missing), file=sys.stderr)
+              print(f"  registered: {names}", file=sys.stderr)
+              sys.exit(1)
+          if len(tools) < 25:
+              print(f"FAIL: only {len(tools)} tools, expected >=25",
+                    file=sys.stderr)
               sys.exit(1)
           PY
 
