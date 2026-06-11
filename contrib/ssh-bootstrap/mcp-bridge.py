@@ -1,44 +1,62 @@
 #!/usr/bin/env python3
-"""mcp-bridge.py — stdio↔SSH-tunneled-TCP MCP relay.
+"""mcp-bridge.py — agentless MCP bridge from Host A to tai on Host B.
 
-This is what Claude spawns as its MCP server command for a remote
-tai. It:
+This is what Claude spawns as its MCP server command. It does the
+entire setup transparently:
 
-  1. SSHes to the target and reads the per-session token from
-     /tmp/tai-token (path overridable).
-  2. Opens an SSH -L tunnel so 127.0.0.1:PORT on the local host
-     reaches 127.0.0.1:PORT on the remote (where tcsh is listening).
-  3. Connects to localhost:PORT, sends `TAI/1\\n<token>\\n`.
-  4. Waits for `OK\\n` from the server.
-  5. Relays Claude's stdio ↔ socket bidirectionally for the rest
-     of the session.
+  1. Ensures /tmp/tai on Host B matches our local TAI_BINARY (scp's
+     it over only if missing or sha mismatches — typically free
+     after first session).
+  2. Generates a one-shot launcher.command with a fresh per-session
+     token, scps it, and `open`s it via SSH so it runs inside
+     Terminal.app on B. The launcher starts a detached
+     `tcsh --listen PORT --token T` listener under Terminal.app's
+     TCC scope.
+  3. Waits (via SSH pgrep, NOT TCP probe — that would consume the
+     single-connection listener) until tcsh is bound.
+  4. Opens an SSH `-L PORT:127.0.0.1:PORT` tunnel.
+  5. Connects, sends `TAI/1\\n<token>\\n` handshake, waits for `OK\\n`.
+  6. Relays Claude's stdio ↔ socket bidirectionally.
 
-The SSH tunnel goes the "normal" direction (A → B). The token
-fetched in step 1 is what authenticates the connection to a tcsh
-listener that B itself started inside Terminal.app — so the bridge
-spawned by sshd never participates in TCC; tcsh's permissions
-come from Terminal.app (its responsible process at exec time).
+The user never runs bootstrap.sh — Claude's MCP-server-spawn IS the
+bootstrap. `contrib/ssh-bootstrap/bootstrap.sh` stays around as a
+debug / manual-pre-stage tool but isn't required for normal use.
 
 Usage:    mcp-bridge.py user@hostB PORT [/path/to/remote-token]
 
+Env:
+    TAI_BINARY     local path to tai-bundled-macos-universal2
+                   (default: /usr/local/bin/tai). Must exist + be
+                   executable; sha256 is compared against /tmp/tai
+                   on the remote each session.
+
 Exit codes:
     0   client (Claude) closed the channel cleanly
-    1   handshake / token / tunnel error  (diagnostic on stderr)
+    1   bootstrap / handshake / tunnel error  (diagnostic on stderr)
    64   missing or bad argv
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
 import time
 
 DEFAULT_TOKEN_PATH = "/tmp/tai-token"
+DEFAULT_TAI_BINARY = "/usr/local/bin/tai"
+DEFAULT_REMOTE_BINARY_PATH = "/tmp/tai"
+DEFAULT_REMOTE_LAUNCHER_PATH = "/tmp/launcher.command"
+DEFAULT_REMOTE_LOG_PATH = "/tmp/tai-listener.log"
+
 TUNNEL_READY_TIMEOUT_S = 10.0
-HANDSHAKE_TIMEOUT_S = 10.0
+LISTENER_READY_TIMEOUT_S = 10.0
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -46,48 +64,170 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-def fetch_token(target: str, remote_path: str) -> str:
-    # CRITICAL: stdin=DEVNULL. subprocess.run defaults stdin to
-    # INHERIT from the parent — meaning ssh would read from
-    # mcp-bridge.py's stdin (the pipe carrying Claude's MCP
-    # frames). ssh appears to consume bytes from stdin even when
-    # the remote command (`cat /tmp/tai-token`) doesn't read its
-    # own stdin. Without DEVNULL here, the very first ssh in
-    # main() silently eats whatever was already buffered in the
-    # pipe and Claude's frames are lost before relay() ever runs.
-    # Symptom: relay sees `stdin EOF` immediately and stdout is
-    # empty. Took an embarrassingly long time to find.
-    proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", target, "cat", remote_path],
-        capture_output=True, text=True, timeout=15,
-        stdin=subprocess.DEVNULL,
+# ---------------------------------------------------------------------------
+# Step 1 — ensure the remote binary matches our local one
+# ---------------------------------------------------------------------------
+
+
+def _ssh(target: str, remote_cmd: str, *, timeout: float = 15.0,
+         check: bool = False) -> subprocess.CompletedProcess:
+    """Run `ssh -o BatchMode=yes target <cmd>` with stdin closed so
+    we never accidentally eat the parent's stdin pipe."""
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", target, remote_cmd],
+        capture_output=True, text=True, timeout=timeout,
+        stdin=subprocess.DEVNULL, check=check,
     )
-    if proc.returncode != 0:
-        die(f"fetching {remote_path} from {target}: "
-            f"{(proc.stderr or 'ssh failed').strip()}")
-    token = proc.stdout.strip()
-    if not token:
-        die(f"{remote_path} on {target} is empty")
+
+
+def _scp(local: str, remote: str, *, timeout: float = 600.0) -> None:
+    subprocess.run(
+        ["scp", "-o", "BatchMode=yes", "-q", local, remote],
+        stdin=subprocess.DEVNULL, timeout=timeout, check=True,
+    )
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ensure_binary(target: str, local_path: str) -> None:
+    if not os.path.isfile(local_path):
+        die(f"TAI_BINARY={local_path} not found")
+    if not os.access(local_path, os.X_OK):
+        die(f"TAI_BINARY={local_path} not executable (run `chmod +x`)")
+
+    sys.stderr.write(
+        f"mcp-bridge: checking {target}:{DEFAULT_REMOTE_BINARY_PATH}\n")
+    r = _ssh(target, f"shasum -a 256 {DEFAULT_REMOTE_BINARY_PATH} 2>/dev/null "
+                     f"| awk '{{print $1}}'")
+    remote_sha = r.stdout.strip()
+    local_sha = _sha256(local_path)
+
+    if remote_sha == local_sha:
+        sys.stderr.write(
+            "mcp-bridge: remote binary already up to date\n")
+        return
+
+    sys.stderr.write(
+        f"mcp-bridge: shipping binary "
+        f"({os.path.getsize(local_path) / 1_048_576:.0f} MB) → "
+        f"{target}:{DEFAULT_REMOTE_BINARY_PATH}\n")
+    _scp(local_path, f"{target}:{DEFAULT_REMOTE_BINARY_PATH}")
+    _ssh(target,
+         f"chmod +x {DEFAULT_REMOTE_BINARY_PATH} && "
+         f"xattr -d com.apple.quarantine {DEFAULT_REMOTE_BINARY_PATH} "
+         f"2>/dev/null || true",
+         check=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — generate launcher.command with fresh token, scp it, fire it
+# ---------------------------------------------------------------------------
+
+
+def fire_listener(target: str, port: int) -> str:
+    """Ship a freshly-templated launcher.command and fire it through
+    `open` so it runs inside Terminal.app. Returns the token baked
+    into this launch."""
+    token = secrets.token_hex(32)
+
+    launcher = textwrap.dedent(f"""\
+        #!/bin/bash
+        # Auto-generated by mcp-bridge.py per Claude session — DO NOT EDIT.
+        # Runs inside Terminal.app on Host B so the spawned tcsh inherits
+        # Terminal.app's TCC permissions (Accessibility / Screen Recording).
+        set -eu
+
+        ln -sf {DEFAULT_REMOTE_BINARY_PATH} /tmp/tcsh
+        printf '%s\\n' '{token}' > {DEFAULT_TOKEN_PATH}
+        chmod 600 {DEFAULT_TOKEN_PATH}
+
+        # Kill any prior listener (single-connection design).
+        pkill -f '^/tmp/tcsh --listen' >/dev/null 2>&1 || true
+
+        # Detached listener — nohup + disown so the Terminal window
+        # can close while it keeps running. TCC responsibility is
+        # set at exec() time so it stays Terminal.app even after
+        # this parent bash exits and tcsh is reparented to launchd.
+        nohup /tmp/tcsh --listen {port} --token '{token}' \\
+            < /dev/null > {DEFAULT_REMOTE_LOG_PATH} 2>&1 &
+        disown
+
+        # Auto-close THIS Terminal window after a beat. Background
+        # so it fires after this script's exit.
+        ( sleep 1 && \\
+          osascript -e 'tell application "Terminal" to close (every window whose name contains "launcher")' \\
+            >/dev/null 2>&1 ) &
+        exit 0
+        """)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".command", delete=False,
+    ) as tmp:
+        tmp.write(launcher)
+        local_launcher = tmp.name
+
+    try:
+        os.chmod(local_launcher, 0o755)
+        sys.stderr.write(
+            f"mcp-bridge: shipping launcher → "
+            f"{target}:{DEFAULT_REMOTE_LAUNCHER_PATH}\n")
+        _scp(local_launcher, f"{target}:{DEFAULT_REMOTE_LAUNCHER_PATH}",
+             timeout=60.0)
+        sys.stderr.write(
+            "mcp-bridge: firing launcher inside Terminal.app on remote\n")
+        _ssh(target,
+             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && "
+             f"open {DEFAULT_REMOTE_LAUNCHER_PATH}",
+             check=True)
+    finally:
+        os.unlink(local_launcher)
+
     return token
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — wait for tcsh to bind. Check via SSH pgrep so we don't
+# consume the single-connection listener with a TCP probe.
+# ---------------------------------------------------------------------------
+
+
+def wait_for_listener(target: str) -> None:
+    sys.stderr.write("mcp-bridge: waiting for tcsh listener to bind\n")
+    deadline = time.time() + LISTENER_READY_TIMEOUT_S
+    while time.time() < deadline:
+        r = _ssh(target, "pgrep -f '^/tmp/tcsh --listen'", timeout=5.0)
+        if r.returncode == 0 and r.stdout.strip():
+            return
+        time.sleep(0.3)
+    die(f"listener didn't appear on remote within "
+        f"{LISTENER_READY_TIMEOUT_S}s "
+        f"(check /tmp/tai-listener.log on the remote for errors)")
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — open SSH -L tunnel. Do NOT probe via TCP connect.
+# ---------------------------------------------------------------------------
 
 
 def open_tunnel(target: str, port: int) -> subprocess.Popen:
     """Open `ssh -L PORT:127.0.0.1:PORT TARGET` and return the Popen.
 
-    CRITICAL: do NOT probe the local forwarded port by opening test
-    TCP connects. Each successful test-connect is forwarded through
-    the tunnel to tcsh's listener — and `tcsh --listen` is single-
-    connection. The probe IS the session: tcsh accepts the test
-    connect, the probe immediately closes the socket without sending
-    anything, tcsh reads an empty line, logs 'bad magic prefix' to
-    its log, and exits. By the time the real handshake-connect runs,
-    tcsh is gone → ConnectionResetError.
+    Do NOT probe the local forwarded port by opening test TCP
+    connects. Each successful test-connect is forwarded through the
+    tunnel to tcsh's listener — and `tcsh --listen` is single-
+    connection. The probe IS the session: tcsh accepts the test,
+    the probe immediately closes, tcsh reads an empty line, logs
+    'bad magic prefix', and exits. By the time the real handshake-
+    connect runs, tcsh is gone → ConnectionResetError.
 
-    Instead, trust ExitOnForwardFailure=yes plus a short settle
-    window. If ssh is still alive after settling, the forward is up
-    (in practice ssh binds the local port within ~100 ms on
-    loopback). If the forward can't bind (port in use, etc.), ssh
-    exits and we read the error from its captured stderr.
+    Instead, trust ExitOnForwardFailure=yes + a short settle. If
+    ssh is still alive after settling, the forward is up.
     """
     proc = subprocess.Popen(
         ["ssh", "-N", "-T",
@@ -107,7 +247,7 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
         elapsed += settle
         rc = proc.poll()
         if rc is None:
-            return proc        # still alive → forward is up
+            return proc
         err = (proc.stderr.read() or b"").decode(errors="replace").strip()
         die(f"ssh tunnel exited early (rc={rc}): "
             f"{err or '(no stderr captured)'}")
@@ -115,21 +255,13 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
     die(f"ssh tunnel didn't settle within {TUNNEL_READY_TIMEOUT_S}s")
 
 
-def handshake(sock: socket.socket, token: str) -> bytes:
-    """Send `TAI/1\\n<token>\\n`, wait for `OK\\n`. Returns any bytes
-    that arrived after the `OK\\n` (which already belong to the MCP
-    stream and need to be forwarded immediately).
+# ---------------------------------------------------------------------------
+# Step 5 — handshake. Uses blocking I/O (no settimeout dance, which
+# empirically degrades subsequent recv on this socket).
+# ---------------------------------------------------------------------------
 
-    Uses blocking I/O — NO settimeout(). Empirically, the
-    settimeout(X) + settimeout(None) dance broke the subsequent
-    relay's daemon-thread `recv()` on at least one macOS box: the
-    socket appeared to stay in a degraded mode where recv blocked
-    but never returned data, even though the inline-equivalent code
-    without the settimeout calls worked fine end-to-end. This is
-    likely a Python/macOS subtlety around how `settimeout(None)`
-    interacts with non-blocking mode internally. The handshake is
-    fast enough that a separate timeout isn't worth the risk —
-    fail-on-server-close is enough."""
+
+def handshake(sock: socket.socket, token: str) -> bytes:
     sock.sendall(f"TAI/1\n{token}\n".encode())
     buf = b""
     while b"\n" not in buf:
@@ -143,26 +275,18 @@ def handshake(sock: socket.socket, token: str) -> bytes:
     return rest
 
 
+# ---------------------------------------------------------------------------
+# Step 6 — bidirectional stdio ↔ socket relay
+# ---------------------------------------------------------------------------
+
+
 def relay(sock: socket.socket, primer: bytes) -> None:
-    """Bidirectional pump between Claude's stdio and the socket. The
-    server's first bytes of MCP framing may have already arrived
-    during the handshake recv — `primer` holds them and gets
-    flushed before the pump starts.
+    """Foreground stdin pump + one daemon reader.
 
-    Structure: one daemon thread reads sock → stdout. Foreground
-    thread reads stdin → sock. When stdin EOFs, foreground shuts
-    down the WR half of the socket (so the server sees EOF on its
-    stdin side and finishes its MCP loop). Foreground then JOINS
-    the reader so we don't kill it mid-recv before all responses
-    have drained.
-
-    Why this matters: an earlier attempt used a `stop` event and a
-    100ms main-poll. When stdin EOFed, the event fired, main exited,
-    and the daemon reader was killed before draining the server's
-    responses — so stdout ended up empty even though the server had
-    sent kilobytes of MCP. The bug only showed up at session-end;
-    during the session it looked like everything was working.
-    """
+    When stdin EOFs, foreground shuts down SHUT_WR (so the server
+    sees EOF on its stdin and finishes its MCP loop), then JOINs
+    the reader so we don't kill it mid-recv before the final
+    responses have drained."""
     if primer:
         sys.stdout.buffer.write(primer)
         sys.stdout.buffer.flush()
@@ -188,17 +312,17 @@ def relay(sock: socket.socket, primer: bytes) -> None:
                 break
             sock.sendall(data)
     finally:
-        # Tell the server we're done writing — it sees EOF on its
-        # stdin and finishes processing any pending requests.
         try:
             sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 
-    # Give the reader time to drain the server's final responses +
-    # see the server close its end. Bounded so we don't hang if the
-    # server never closes (shouldn't happen, but defensively).
     reader.join(timeout=30.0)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -211,17 +335,17 @@ def main() -> None:
         die(f"port must be an integer, got {port_s!r}", 64)
     if port < 1 or port > 65535:
         die(f"port out of range: {port}", 64)
-    remote_token_path = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_TOKEN_PATH
 
-    sys.stderr.write(
-        f"mcp-bridge: fetching token from {target}:{remote_token_path}\n")
-    token = fetch_token(target, remote_token_path)
+    tai_binary = os.environ.get("TAI_BINARY", DEFAULT_TAI_BINARY)
 
-    sys.stderr.write(
-        f"mcp-bridge: opening tunnel localhost:{port} → {target}:{port}\n")
+    # Steps 1–3: ensure the remote is ready.
+    ensure_binary(target, tai_binary)
+    token = fire_listener(target, port)
+    wait_for_listener(target)
+
+    # Step 4: tunnel.
     tunnel = open_tunnel(target, port)
 
-    # Make sure tunnel dies with us, even on SIGTERM from Claude.
     def cleanup(*_: object) -> None:
         try:
             tunnel.terminate()
@@ -233,12 +357,13 @@ def main() -> None:
     signal.signal(signal.SIGINT, cleanup)
 
     try:
+        # Step 5: handshake.
         sock = socket.socket()
         sock.connect(("127.0.0.1", port))
-
         sys.stderr.write("mcp-bridge: handshake (TAI/1 + token)\n")
         primer = handshake(sock, token)
         sys.stderr.write("mcp-bridge: ready, relaying MCP\n")
+        # Step 6: relay.
         relay(sock, primer)
     finally:
         try:

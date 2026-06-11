@@ -1,18 +1,17 @@
 #!/bin/bash
 # smoke.sh — end-to-end agentless verification.
 #
-# Drives the same mcp-bridge.py path Claude will use, but with a
-# canned JSON-RPC sequence so you can verify the SSH-bootstrap
-# round-trip works before plugging it into Claude.
+# Drives mcp-bridge.py the same way Claude will, with a canned
+# JSON-RPC sequence. mcp-bridge.py does the full auto-bootstrap
+# itself — no separate bootstrap.sh invocation needed.
 #
 # Sends: initialize → notifications/initialized → tools/list →
 # tools/call (doctor) → tools/call (screen_move 500 500). Looks
 # for the tools/list count and for the screen_move response.
 #
 # Usage:
-#     ./smoke.sh user@hostB [PORT]
-#
-# Expects ./bootstrap.sh has already run against the same target.
+#     TAI_BINARY=/path/to/tai-bundled-macos-universal2 \
+#         ./smoke.sh user@hostB [PORT]
 
 set -u    # no `-e`: we WANT the script to keep going after a bridge
           # failure so the stderr log + diagnostics get printed
