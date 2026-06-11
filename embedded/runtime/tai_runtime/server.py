@@ -47,6 +47,8 @@ def _backfill_env_from_libc() -> None:
         return
     for name in (
         "HOLO_SIKULI_JAR",
+        "HOLO_SIKULI_API_JAR",
+        "HOLO_JYTHON_JAR",
         "HOLO_BRIDGE_SCRIPT",
         "HOLO_TEMPLATE_DIR",
     ):
@@ -385,7 +387,8 @@ def _format_doctor(d: dict[str, Any]) -> str:
 
     # SikuliX / bridge
     lines.append("SikuliX bundle")
-    for name, label in (("HOLO_SIKULI_JAR", "Jar"),
+    for name, label in (("HOLO_SIKULI_API_JAR", "API jar"),
+                        ("HOLO_JYTHON_JAR", "Jython jar"),
                         ("HOLO_BRIDGE_SCRIPT", "Bridge script")):
         info = d["env"].get(name, {})
         if info.get("set") and info.get("exists"):
@@ -524,12 +527,18 @@ def _run_doctor() -> dict[str, Any]:
         "argv0": sys.argv[0] if sys.argv else None,
     }
 
-    # The three HOLO_* env vars boot.c set up — confirm they point
-    # at extant files. The libc-backfill at import time above makes
-    # these visible via os.environ.
+    # The HOLO_* env vars boot.c set up — confirm they point at
+    # extant files. The libc-backfill at import time above makes
+    # these visible via os.environ. HOLO_SIKULI_JAR is a legacy
+    # alias for HOLO_SIKULI_API_JAR (see holo v0.1.0a33 bridge.py).
     result["env"] = {
         name: _check_path(os.environ.get(name))
-        for name in ("HOLO_SIKULI_JAR", "HOLO_BRIDGE_SCRIPT", "HOLO_TEMPLATE_DIR")
+        for name in (
+            "HOLO_SIKULI_API_JAR",
+            "HOLO_JYTHON_JAR",
+            "HOLO_BRIDGE_SCRIPT",
+            "HOLO_TEMPLATE_DIR",
+        )
     }
 
     # Java — top failure mode on a fresh macOS install.
@@ -717,10 +726,11 @@ def _summarize(result: dict[str, Any]) -> list[str]:
             "Screen Recording permission appears denied for the TCC "
             "responsible process."
         )
-    # The SikuliX jar + bridge script are read-only prerequisites:
-    # if they're missing, the bundle's broken. HOLO_TEMPLATE_DIR is
-    # a write-on-demand cache so non-existence at startup is fine.
-    for name in ("HOLO_SIKULI_JAR", "HOLO_BRIDGE_SCRIPT"):
+    # The SikuliX api jar, jython jar, and bridge script are read-
+    # only prerequisites: if they're missing, the bundle's broken.
+    # HOLO_TEMPLATE_DIR is a write-on-demand cache so non-existence
+    # at startup is fine.
+    for name in ("HOLO_SIKULI_API_JAR", "HOLO_JYTHON_JAR", "HOLO_BRIDGE_SCRIPT"):
         info = result["env"].get(name, {})
         if info.get("set") and not info.get("exists"):
             issues.append(f"{name} points at a missing path: {info.get('value')}")

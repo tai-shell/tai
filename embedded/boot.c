@@ -70,7 +70,7 @@ tai_resolve_exe_path (char *out)
   return 0;
 }
 
-/* The six filesystem locations the embedded interpreter needs.
+/* The seven filesystem locations the embedded interpreter needs.
    Filled from the bundled-payload cache when present, otherwise
    from the dev-tree layout next to the running binary.
 
@@ -78,13 +78,19 @@ tai_resolve_exe_path (char *out)
    (encodings/, lib-dynload/, etc.) — must be set via config.home
    BEFORE Py_InitializeFromConfig, otherwise init fails at the
    "Failed to import encodings module" bootstrap step. The string
-   convention: cpython_home contains a `lib/python3.13/` subtree. */
+   convention: cpython_home contains a `lib/python3.13/` subtree.
+
+   sikuli_jar is the *API* jar now (sikulixapi-2.0.5-macos.jar)
+   paired with jython_jar on the JVM classpath — see holo v0.1.0a33
+   bridge.py. The legacy IDE jar wedged on macOS 15 via jkeymaster's
+   Carbon hotkey provider; the API + Jython invocation skips that. */
 typedef struct {
   char cpython_home[PATH_MAX];	/* CPython prefix; has lib/python3.13/ */
   char holo_src[PATH_MAX];	/* parent of the `holo` package      */
   char runtime[PATH_MAX];	/* parent of the `tai_runtime` package*/
   char site_pkgs[PATH_MAX];	/* pip-installed dep closure          */
-  char sikuli_jar[PATH_MAX];	/* SikuliX jar absolute path          */
+  char sikuli_jar[PATH_MAX];	/* sikulixapi-*.jar absolute path     */
+  char jython_jar[PATH_MAX];	/* jython-standalone-*.jar abs path   */
   char bridge_script[PATH_MAX];	/* bridge.py absolute path            */
 } tai_runtime_paths_t;
 
@@ -101,7 +107,9 @@ tai_paths_from_cache_dir (const char *cache_dir,
   snprintf (out->site_pkgs,     sizeof out->site_pkgs,
 	    "%s/site-packages",                  cache_dir);
   snprintf (out->sikuli_jar,    sizeof out->sikuli_jar,
-	    "%s/sikuli/sikulixide-2.0.5.jar",    cache_dir);
+	    "%s/sikuli/sikulixapi-2.0.5-macos.jar", cache_dir);
+  snprintf (out->jython_jar,    sizeof out->jython_jar,
+	    "%s/sikuli/jython-standalone-2.7.4.jar", cache_dir);
   snprintf (out->bridge_script, sizeof out->bridge_script,
 	    "%s/holo/bridge/bridge.py",          cache_dir);
 }
@@ -119,7 +127,9 @@ tai_paths_from_dev_tree (const char *exe_dir,
   snprintf (out->site_pkgs,     sizeof out->site_pkgs,
 	    "%s/build/site-packages",            exe_dir);
   snprintf (out->sikuli_jar,    sizeof out->sikuli_jar,
-	    "%s/build/sikuli/sikulixide-2.0.5.jar", exe_dir);
+	    "%s/build/sikuli/sikulixapi-2.0.5-macos.jar", exe_dir);
+  snprintf (out->jython_jar,    sizeof out->jython_jar,
+	    "%s/build/sikuli/jython-standalone-2.7.4.jar", exe_dir);
   snprintf (out->bridge_script, sizeof out->bridge_script,
 	    "%s/vendor/holo/bridge/bridge.py",   exe_dir);
 }
@@ -228,8 +238,13 @@ _tai_embedded_init (void)
      Setting these from C means a user invoking the binary doesn't
      need anything in their shell environment for screen_* tools
      to work. overwrite=0: the user's explicit env wins. */
-  setenv ("HOLO_SIKULI_JAR",    paths.sikuli_jar,    /*overwrite=*/0);
-  setenv ("HOLO_BRIDGE_SCRIPT", paths.bridge_script, /*overwrite=*/0);
+  /* HOLO_SIKULI_JAR is the legacy env var name; vendored holo
+     v0.1.0a33+ reads it as a fallback for the new
+     HOLO_SIKULI_API_JAR. Set both to be unambiguous. */
+  setenv ("HOLO_SIKULI_JAR",     paths.sikuli_jar,    /*overwrite=*/0);
+  setenv ("HOLO_SIKULI_API_JAR", paths.sikuli_jar,    /*overwrite=*/0);
+  setenv ("HOLO_JYTHON_JAR",     paths.jython_jar,    /*overwrite=*/0);
+  setenv ("HOLO_BRIDGE_SCRIPT",  paths.bridge_script, /*overwrite=*/0);
   {
     const char *home = getenv ("HOME");
     if (home != NULL)

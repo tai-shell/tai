@@ -72,12 +72,16 @@ def _spawn_with(fake: _FakeProc):
 
 
 def _stub_paths(client: BridgeClient, tmp_path: Path) -> None:
-    """Avoid filesystem dependence — point the client at any two files."""
-    jar = tmp_path / "sikulixapi.jar"
-    jar.write_bytes(b"")
+    """Avoid filesystem dependence — point the client at three stub files
+    (api jar, jython jar, bridge script)."""
+    api_jar = tmp_path / "sikulixapi.jar"
+    api_jar.write_bytes(b"")
+    jython_jar = tmp_path / "jython-standalone.jar"
+    jython_jar.write_bytes(b"")
     script = tmp_path / "bridge.py"
     script.write_text("# stub")
-    client.jar_path = jar
+    client.api_jar_path = api_jar
+    client.jython_jar_path = jython_jar
     client.script_path = script
 
 
@@ -100,11 +104,18 @@ class TestStartAndStop:
         try:
             cmd = captured["cmd"]
             assert cmd[0] == "java"
-            assert "-jar" in cmd
-            assert str(client.jar_path) in cmd
-            assert "-r" in cmd
+            # New invocation shape: -cp api.jar:jython.jar
+            # org.python.util.jython bridge.py  — no -jar, no -r, no
+            # --transport (stdio is bridge.py's default).
+            assert "-cp" in cmd
+            cp_index = cmd.index("-cp")
+            classpath = cmd[cp_index + 1]
+            assert str(client.api_jar_path) in classpath
+            assert str(client.jython_jar_path) in classpath
+            assert "org.python.util.jython" in cmd
             assert str(client.script_path) in cmd
-            assert "--transport" in cmd and "stdio" in cmd
+            assert "-jar" not in cmd
+            assert "-r" not in cmd
             # The start path also wrote a ping to stdin.
             sent = fake.stdin.getvalue().decode().strip().splitlines()
             assert len(sent) == 1
@@ -539,6 +550,97 @@ class TestResourceResolution:
         with patch.object(bridge_mod, "ensure_jar", return_value=downloaded) as fake:
             client = BridgeClient()
             assert client._resolve_jar() == downloaded
+        fake.assert_called_once()
+
+
+class TestApiAndJythonResolution:
+    """`_resolve_api_jar()` and `_resolve_jython_jar()` are the new
+    resolvers BridgeClient.start() calls. Same shape as `_resolve_jar`
+    but stricter — the api resolver only accepts `sikulixapi-*.jar`
+    (rejects the IDE jar to keep the macOS-15 Carbon hang from
+    sneaking back in)."""
+
+    def test_api_jar_explicit_path(self, tmp_path):
+        api = tmp_path / "sikulixapi.jar"
+        api.write_bytes(b"")
+        client = BridgeClient(api_jar_path=api)
+        assert client._resolve_api_jar() == api
+
+    def test_api_jar_legacy_jar_path_kwarg(self, tmp_path):
+        # Pre-fix callers passed `jar_path=...` for what we now call
+        # the api jar — keep that working.
+        api = tmp_path / "sikulixapi.jar"
+        api.write_bytes(b"")
+        client = BridgeClient(jar_path=api)
+        assert client._resolve_api_jar() == api
+
+    def test_api_jar_env_var_preferred(self, tmp_path, monkeypatch):
+        api = tmp_path / "sikulixapi.jar"
+        api.write_bytes(b"")
+        monkeypatch.setenv("HOLO_SIKULI_API_JAR", str(api))
+        # Legacy env var also accepted as fallback.
+        monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
+        client = BridgeClient()
+        assert client._resolve_api_jar() == api
+
+    def test_api_jar_legacy_env_var_fallback(self, tmp_path, monkeypatch):
+        api = tmp_path / "sikulixapi.jar"
+        api.write_bytes(b"")
+        monkeypatch.delenv("HOLO_SIKULI_API_JAR", raising=False)
+        monkeypatch.setenv("HOLO_SIKULI_JAR", str(api))
+        client = BridgeClient()
+        assert client._resolve_api_jar() == api
+
+    def test_api_resolver_rejects_ide_jar(self, tmp_path, monkeypatch):
+        # Critical: if only sikulixide-*.jar is on disk and nothing
+        # else, the api resolver must NOT pick it up — it would trigger
+        # the macOS-15 Carbon hang via HotkeyManager. Should fall
+        # through to ensure_api_jar() instead.
+        repo = tmp_path / "repo"
+        (repo / "vendor").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text("")
+        ide_only = repo / "vendor" / "sikulixide-2.0.5.jar"
+        ide_only.write_bytes(b"")
+        monkeypatch.delenv("HOLO_SIKULI_API_JAR", raising=False)
+        monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
+        monkeypatch.setattr("holo.bridge._repo_root", lambda: repo, raising=True)
+        monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        monkeypatch.setattr(
+            "holo.bridge._user_cache_dir", lambda: tmp_path / "empty-cache"
+        )
+        downloaded = tmp_path / "downloaded-api.jar"
+        downloaded.write_bytes(b"")
+        with patch.object(bridge_mod, "ensure_api_jar", return_value=downloaded) as fake:
+            client = BridgeClient()
+            assert client._resolve_api_jar() == downloaded
+        fake.assert_called_once()
+
+    def test_jython_jar_explicit_path(self, tmp_path):
+        jython = tmp_path / "jython-standalone.jar"
+        jython.write_bytes(b"")
+        client = BridgeClient(jython_jar_path=jython)
+        assert client._resolve_jython_jar() == jython
+
+    def test_jython_jar_env_var(self, tmp_path, monkeypatch):
+        jython = tmp_path / "jython-standalone.jar"
+        jython.write_bytes(b"")
+        monkeypatch.setenv("HOLO_JYTHON_JAR", str(jython))
+        client = BridgeClient()
+        assert client._resolve_jython_jar() == jython
+
+    def test_jython_jar_falls_through_to_ensure(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HOLO_JYTHON_JAR", raising=False)
+        monkeypatch.delenv("HOLO_BRIDGE_NO_DOWNLOAD", raising=False)
+        monkeypatch.setattr("holo.bridge._repo_root", lambda: tmp_path, raising=True)
+        monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        monkeypatch.setattr(
+            "holo.bridge._user_cache_dir", lambda: tmp_path / "empty-cache"
+        )
+        downloaded = tmp_path / "downloaded-jython.jar"
+        downloaded.write_bytes(b"")
+        with patch.object(bridge_mod, "ensure_jython_jar", return_value=downloaded) as fake:
+            client = BridgeClient()
+            assert client._resolve_jython_jar() == downloaded
         fake.assert_called_once()
 
 

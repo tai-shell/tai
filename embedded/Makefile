@@ -12,14 +12,23 @@ CPYTHON_PFX   := $(BUILD_DIR)/cpython-install
 SITE_PKGS     := $(BUILD_DIR)/site-packages
 SIKULI_DIR    := $(BUILD_DIR)/sikuli
 
-# SikuliX jar — pinned from vendor/holo/src/holo/bridge.py. Bump in
-# lockstep with the vendored holo subtree pin in vendor/holo. boot.c
-# points HOLO_SIKULI_JAR at the cached file at runtime so the bridge
-# subprocess can locate it without an env-var dance from the user.
-SIKULI_JAR_NAME := sikulixide-2.0.5.jar
-SIKULI_JAR_URL  := https://github.com/nospaceleftondevice/holo/releases/download/vendored-sikulix-2.0.5/$(SIKULI_JAR_NAME)
-SIKULI_JAR_SHA  := f4b0b50c8e413094e78cd1d8fed02ae65f62f8c53ed00da0562fdedf4acff729
-SIKULI_JAR      := $(SIKULI_DIR)/$(SIKULI_JAR_NAME)
+# SikuliX bridge jars — pinned to match vendor/holo's bridge.py.
+# Two jars now (was one, sikulixide-2.0.5.jar). Holo as of v0.1.0a33
+# invokes the bridge via `java -cp api.jar:jython.jar
+# org.python.util.jython bridge.py` instead of `java -jar ide.jar -r
+# bridge.py` — the IDE main triggers jkeymaster's CarbonProvider on
+# macOS 15+ which hangs forever. The api+jython invocation skips it
+# entirely. See holo PR #118 and docs/embedded-holo.md.
+# Bump these in lockstep with the vendored holo subtree pin.
+SIKULI_API_JAR_NAME := sikulixapi-2.0.5-macos.jar
+SIKULI_API_JAR_URL  := https://github.com/oculix-org/SikuliX1/releases/download/v2.0.5/$(SIKULI_API_JAR_NAME)
+SIKULI_API_JAR_SHA  := 6a486167696280b4601bd7cf1ec7c4669da696403c05cc9bda7f478507aac769
+SIKULI_API_JAR      := $(SIKULI_DIR)/$(SIKULI_API_JAR_NAME)
+
+JYTHON_JAR_NAME := jython-standalone-2.7.4.jar
+JYTHON_JAR_URL  := https://repo1.maven.org/maven2/org/python/jython-standalone/2.7.4/$(JYTHON_JAR_NAME)
+JYTHON_JAR_SHA  := 1fba1769effcc8b19f5e10436bc8274a158ce988559f257927c24c73bb137f3c
+JYTHON_JAR      := $(SIKULI_DIR)/$(JYTHON_JAR_NAME)
 
 # Python 3.13 used for `pip install --target` into SITE_PKGS. Must be
 # 3.13.x to produce wheels with the same ABI as our embedded CPython.
@@ -76,7 +85,7 @@ help:
 	@echo "  deps            Install holo's pure-Python + Rust-extension deps"
 	@echo "                  into build/site-packages/ for embedding"
 	@echo "  deps-clean      Remove build/site-packages/ only"
-	@echo "  sikuli-jar      Download SikuliX jar (~123 MB) into build/sikuli/"
+	@echo "  sikuli-jar      Download SikuliX api jar + Jython (~133 MB total) into build/sikuli/"
 	@echo "                  (needed for screen_* tools; one-time)"
 	@echo "  sikuli-clean    Remove build/sikuli/ only"
 	@echo "  bundle          Produce build/tai-bundled — the single-file"
@@ -154,25 +163,43 @@ $(SITE_PKGS)/.stamp:
 deps-clean:
 	rm -rf $(SITE_PKGS)
 
-# SikuliX jar — large (123 MB), versioned, sha256-verified. Downloaded
-# once into build/sikuli/ and reused for every screen tool call. boot.c
-# sets HOLO_SIKULI_JAR=$(SIKULI_JAR) so the bridge subprocess locates it
+# SikuliX bridge jars — two now, both large, both pinned + sha256-
+# verified. Downloaded once into build/sikuli/ and reused for every
+# screen tool call. boot.c sets HOLO_SIKULI_JAR (legacy alias for the
+# api jar) + HOLO_JYTHON_JAR so the bridge subprocess locates them
 # without user intervention.
-sikuli-jar: $(SIKULI_JAR)
+sikuli-jar: $(SIKULI_API_JAR) $(JYTHON_JAR)
 
-$(SIKULI_JAR):
+$(SIKULI_API_JAR):
 	@mkdir -p $(SIKULI_DIR)
-	@if command -v curl >/dev/null 2>&1; then \
-	    echo "==> Downloading $(SIKULI_JAR_NAME) (~123 MB)"; \
-	    curl -fL --progress-bar -o $@.partial $(SIKULI_JAR_URL); \
-	else \
+	@if ! command -v curl >/dev/null 2>&1; then \
 	    echo "ERROR: curl not found"; exit 1; \
 	fi
+	@echo "==> Downloading $(SIKULI_API_JAR_NAME) (~83 MB)"
+	@curl -fL --progress-bar -o $@.partial $(SIKULI_API_JAR_URL)
 	@echo "==> Verifying SHA-256"
 	@actual=$$(shasum -a 256 $@.partial | cut -d' ' -f1); \
-	if [ "$$actual" != "$(SIKULI_JAR_SHA)" ]; then \
-	    echo "ERROR: sha256 mismatch on $(SIKULI_JAR_NAME)"; \
-	    echo "  expected: $(SIKULI_JAR_SHA)"; \
+	if [ "$$actual" != "$(SIKULI_API_JAR_SHA)" ]; then \
+	    echo "ERROR: sha256 mismatch on $(SIKULI_API_JAR_NAME)"; \
+	    echo "  expected: $(SIKULI_API_JAR_SHA)"; \
+	    echo "  got:      $$actual"; \
+	    rm -f $@.partial; exit 1; \
+	fi
+	@mv $@.partial $@
+	@echo "==> $@ ($$(du -h $@ | cut -f1))"
+
+$(JYTHON_JAR):
+	@mkdir -p $(SIKULI_DIR)
+	@if ! command -v curl >/dev/null 2>&1; then \
+	    echo "ERROR: curl not found"; exit 1; \
+	fi
+	@echo "==> Downloading $(JYTHON_JAR_NAME) (~50 MB)"
+	@curl -fL --progress-bar -o $@.partial $(JYTHON_JAR_URL)
+	@echo "==> Verifying SHA-256"
+	@actual=$$(shasum -a 256 $@.partial | cut -d' ' -f1); \
+	if [ "$$actual" != "$(JYTHON_JAR_SHA)" ]; then \
+	    echo "ERROR: sha256 mismatch on $(JYTHON_JAR_NAME)"; \
+	    echo "  expected: $(JYTHON_JAR_SHA)"; \
 	    echo "  got:      $$actual"; \
 	    rm -f $@.partial; exit 1; \
 	fi
@@ -203,7 +230,8 @@ BUNDLE_STAGE   := $(BUILD_DIR)/bundle
 BUNDLE_DEPS = \
     $(TAI_INPUT_BIN) \
     $(SITE_PKGS)/.stamp \
-    $(SIKULI_JAR) \
+    $(SIKULI_API_JAR) \
+    $(JYTHON_JAR) \
     $(wildcard $(TAI_ROOT)/embedded/runtime/tai_runtime/*.py) \
     $(wildcard $(TAI_ROOT)/vendor/holo/src/holo/*.py) \
     $(wildcard $(TAI_ROOT)/vendor/holo/bridge/*.py)
@@ -231,7 +259,8 @@ $(TAI_OUTPUT_BIN): $(BUNDLE_DEPS) $(TAI_ROOT)/embedded/mkbundle.sh
 	@cp -R $(TAI_ROOT)/vendor/holo/bridge $(BUNDLE_STAGE)/holo/bridge
 	@cp -R $(SITE_PKGS) $(BUNDLE_STAGE)/site-packages
 	@mkdir -p $(BUNDLE_STAGE)/sikuli
-	@cp $(SIKULI_JAR) $(BUNDLE_STAGE)/sikuli/
+	@cp $(SIKULI_API_JAR) $(BUNDLE_STAGE)/sikuli/
+	@cp $(JYTHON_JAR) $(BUNDLE_STAGE)/sikuli/
 	@echo "==> Including CPython stdlib (lib/python3.13/)"
 	@mkdir -p $(BUNDLE_STAGE)/cpython/lib
 	@cp -R $(CPYTHON_PFX)/lib/python3.13 $(BUNDLE_STAGE)/cpython/lib/
