@@ -216,6 +216,11 @@ $(TAI_OUTPUT_BIN): $(BUNDLE_DEPS) $(TAI_ROOT)/embedded/mkbundle.sh
 	    echo "  run \`make\` at the repo root first"; \
 	    exit 1; \
 	fi
+	@if [ ! -d $(CPYTHON_PFX)/lib/python3.13 ]; then \
+	    echo "ERROR: $(CPYTHON_PFX)/lib/python3.13 doesn't exist"; \
+	    echo "  run \`make -C embedded cpython\` first"; \
+	    exit 1; \
+	fi
 	@echo "==> Staging payload tree at $(BUNDLE_STAGE)"
 	@rm -rf $(BUNDLE_STAGE)
 	@mkdir -p $(BUNDLE_STAGE)
@@ -227,6 +232,9 @@ $(TAI_OUTPUT_BIN): $(BUNDLE_DEPS) $(TAI_ROOT)/embedded/mkbundle.sh
 	@cp -R $(SITE_PKGS) $(BUNDLE_STAGE)/site-packages
 	@mkdir -p $(BUNDLE_STAGE)/sikuli
 	@cp $(SIKULI_JAR) $(BUNDLE_STAGE)/sikuli/
+	@echo "==> Including CPython stdlib (lib/python3.13/)"
+	@mkdir -p $(BUNDLE_STAGE)/cpython/lib
+	@cp -R $(CPYTHON_PFX)/lib/python3.13 $(BUNDLE_STAGE)/cpython/lib/
 	@find $(BUNDLE_STAGE) -name __pycache__ -type d -exec rm -rf {} +
 	@find $(BUNDLE_STAGE) -name '*.pyc' -delete
 	$(TAI_ROOT)/embedded/mkbundle.sh \
