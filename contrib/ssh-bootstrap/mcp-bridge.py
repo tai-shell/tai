@@ -47,9 +47,20 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def fetch_token(target: str, remote_path: str) -> str:
+    # CRITICAL: stdin=DEVNULL. subprocess.run defaults stdin to
+    # INHERIT from the parent — meaning ssh would read from
+    # mcp-bridge.py's stdin (the pipe carrying Claude's MCP
+    # frames). ssh appears to consume bytes from stdin even when
+    # the remote command (`cat /tmp/tai-token`) doesn't read its
+    # own stdin. Without DEVNULL here, the very first ssh in
+    # main() silently eats whatever was already buffered in the
+    # pipe and Claude's frames are lost before relay() ever runs.
+    # Symptom: relay sees `stdin EOF` immediately and stdout is
+    # empty. Took an embarrassingly long time to find.
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", target, "cat", remote_path],
         capture_output=True, text=True, timeout=15,
+        stdin=subprocess.DEVNULL,
     )
     if proc.returncode != 0:
         die(f"fetching {remote_path} from {target}: "
@@ -61,8 +72,23 @@ def fetch_token(target: str, remote_path: str) -> str:
 
 
 def open_tunnel(target: str, port: int) -> subprocess.Popen:
-    # -N: no remote command, just forward. -T: no TTY. -o
-    # ExitOnForwardFailure: bail if the port can't bind.
+    """Open `ssh -L PORT:127.0.0.1:PORT TARGET` and return the Popen.
+
+    CRITICAL: do NOT probe the local forwarded port by opening test
+    TCP connects. Each successful test-connect is forwarded through
+    the tunnel to tcsh's listener — and `tcsh --listen` is single-
+    connection. The probe IS the session: tcsh accepts the test
+    connect, the probe immediately closes the socket without sending
+    anything, tcsh reads an empty line, logs 'bad magic prefix' to
+    its log, and exits. By the time the real handshake-connect runs,
+    tcsh is gone → ConnectionResetError.
+
+    Instead, trust ExitOnForwardFailure=yes plus a short settle
+    window. If ssh is still alive after settling, the forward is up
+    (in practice ssh binds the local port within ~100 ms on
+    loopback). If the forward can't bind (port in use, etc.), ssh
+    exits and we read the error from its captured stderr.
+    """
     proc = subprocess.Popen(
         ["ssh", "-N", "-T",
          "-o", "ExitOnForwardFailure=yes",
@@ -74,29 +100,37 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    deadline = time.time() + TUNNEL_READY_TIMEOUT_S
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-            die(f"ssh tunnel exited early: {err or '(no stderr)'}")
-        try:
-            with socket.socket() as s:
-                s.settimeout(0.3)
-                s.connect(("127.0.0.1", port))
-            return proc
-        except OSError:
-            time.sleep(0.2)
+    settle = 0.5
+    elapsed = 0.0
+    while elapsed < TUNNEL_READY_TIMEOUT_S:
+        time.sleep(settle)
+        elapsed += settle
+        rc = proc.poll()
+        if rc is None:
+            return proc        # still alive → forward is up
+        err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+        die(f"ssh tunnel exited early (rc={rc}): "
+            f"{err or '(no stderr captured)'}")
     proc.kill()
-    die("ssh tunnel didn't open within "
-        f"{TUNNEL_READY_TIMEOUT_S}s")
+    die(f"ssh tunnel didn't settle within {TUNNEL_READY_TIMEOUT_S}s")
 
 
 def handshake(sock: socket.socket, token: str) -> bytes:
     """Send `TAI/1\\n<token>\\n`, wait for `OK\\n`. Returns any bytes
     that arrived after the `OK\\n` (which already belong to the MCP
-    stream and need to be forwarded immediately)."""
+    stream and need to be forwarded immediately).
+
+    Uses blocking I/O — NO settimeout(). Empirically, the
+    settimeout(X) + settimeout(None) dance broke the subsequent
+    relay's daemon-thread `recv()` on at least one macOS box: the
+    socket appeared to stay in a degraded mode where recv blocked
+    but never returned data, even though the inline-equivalent code
+    without the settimeout calls worked fine end-to-end. This is
+    likely a Python/macOS subtlety around how `settimeout(None)`
+    interacts with non-blocking mode internally. The handshake is
+    fast enough that a separate timeout isn't worth the risk —
+    fail-on-server-close is enough."""
     sock.sendall(f"TAI/1\n{token}\n".encode())
-    sock.settimeout(HANDSHAKE_TIMEOUT_S)
     buf = b""
     while b"\n" not in buf:
         chunk = sock.recv(64)
@@ -106,51 +140,65 @@ def handshake(sock: socket.socket, token: str) -> bytes:
     line, rest = buf.split(b"\n", 1)
     if line != b"OK":
         die(f"handshake rejected: {line.decode(errors='replace')}")
-    sock.settimeout(None)
     return rest
 
 
 def relay(sock: socket.socket, primer: bytes) -> None:
     """Bidirectional pump between Claude's stdio and the socket. The
-    server's first bytes of MCP framing may have already been read
-    during the handshake search — `primer` holds them and gets
-    flushed before the pump starts."""
+    server's first bytes of MCP framing may have already arrived
+    during the handshake recv — `primer` holds them and gets
+    flushed before the pump starts.
+
+    Structure: one daemon thread reads sock → stdout. Foreground
+    thread reads stdin → sock. When stdin EOFs, foreground shuts
+    down the WR half of the socket (so the server sees EOF on its
+    stdin side and finishes its MCP loop). Foreground then JOINS
+    the reader so we don't kill it mid-recv before all responses
+    have drained.
+
+    Why this matters: an earlier attempt used a `stop` event and a
+    100ms main-poll. When stdin EOFed, the event fired, main exited,
+    and the daemon reader was killed before draining the server's
+    responses — so stdout ended up empty even though the server had
+    sent kilobytes of MCP. The bug only showed up at session-end;
+    during the session it looked like everything was working.
+    """
     if primer:
         sys.stdout.buffer.write(primer)
         sys.stdout.buffer.flush()
 
-    stop = threading.Event()
-
     def server_to_stdout() -> None:
-        try:
-            while not stop.is_set():
-                data = sock.recv(4096)
-                if not data:
-                    break
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
-        finally:
-            stop.set()
-
-    def stdin_to_server() -> None:
-        try:
-            while not stop.is_set():
-                data = sys.stdin.buffer.read1(4096)
-                if not data:
-                    break
-                sock.sendall(data)
-        finally:
-            stop.set()
+        while True:
             try:
-                sock.shutdown(socket.SHUT_WR)
+                data = sock.recv(4096)
             except OSError:
-                pass
+                return
+            if not data:
+                return
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
 
-    t1 = threading.Thread(target=server_to_stdout, daemon=True)
-    t2 = threading.Thread(target=stdin_to_server, daemon=True)
-    t1.start(); t2.start()
-    while not stop.is_set():
-        time.sleep(0.1)
+    reader = threading.Thread(target=server_to_stdout, daemon=True)
+    reader.start()
+
+    try:
+        while True:
+            data = sys.stdin.buffer.read1(4096)
+            if not data:
+                break
+            sock.sendall(data)
+    finally:
+        # Tell the server we're done writing — it sees EOF on its
+        # stdin and finishes processing any pending requests.
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    # Give the reader time to drain the server's final responses +
+    # see the server close its end. Bounded so we don't hang if the
+    # server never closes (shouldn't happen, but defensively).
+    reader.join(timeout=30.0)
 
 
 def main() -> None:

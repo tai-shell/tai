@@ -14,7 +14,8 @@
 #
 # Expects ./bootstrap.sh has already run against the same target.
 
-set -eu
+set -u    # no `-e`: we WANT the script to keep going after a bridge
+          # failure so the stderr log + diagnostics get printed
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 TARGET=${1:-}
@@ -50,11 +51,18 @@ trap 'rm -f "$OUT"' EXIT
     # has finished.
     sleep 3
 } | "$BRIDGE" "$TARGET" "$PORT" > "$OUT" 2> /tmp/tai-smoke.stderr.txt
+BRIDGE_EXIT=${PIPESTATUS[1]}
 
 echo ""
 echo "=== bridge stderr ==="
 cat /tmp/tai-smoke.stderr.txt
 echo ""
+echo "=== bridge exit code: $BRIDGE_EXIT ==="
+if [ "$BRIDGE_EXIT" -ne 0 ]; then
+    echo ""
+    echo "(bridge exited non-zero; results section will likely show NO RESPONSE)"
+    echo ""
+fi
 
 # Parse the results
 python3 - <<PY
