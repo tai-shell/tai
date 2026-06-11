@@ -1,14 +1,23 @@
+# -*- coding: utf-8 -*-
 # Jython bridge for holo.
 #
-# Runs inside SikuliX's bundled Jython 2.7 via:
+# Runs under standalone Jython 2.7 invoked DIRECTLY against
+# sikulixapi.jar — bypasses SikuliX's IDE main class so jkeymaster's
+# Carbon hotkey provider (broken on macOS 15+) never loads:
 #
-#     java -jar sikulixapi.jar -r bridge.py -- [bridge args]
+#     java -cp sikulixapi.jar:jython-standalone.jar \
+#          org.python.util.jython bridge.py [bridge args]
 #
-# Bridge args (after the `--` SikuliX uses to separate its own args from
-# script args):
+# Bridge args:
 #
 #     --transport stdio                       (default; daemon spawns JVM as child)
 #     --transport tcp --bind 127.0.0.1 --port 7081 [--token T]
+#
+# The legacy invocation `java -jar sikulixide.jar -r bridge.py --
+# --transport stdio` is still accepted by SikuliX itself, but on
+# macOS 15+ the IDE main triggers HotkeyManager.reset → CarbonProvider
+# .reset which blocks forever, wedging cleanup and indirectly wedging
+# the bridge. The direct-Jython invocation never loads HotkeyManager.
 #
 # Reads line-delimited JSON-RPC requests from the chosen transport,
 # dispatches them to SikuliX APIs, writes JSON-RPC responses back. The
