@@ -267,9 +267,9 @@ $BUILTIN doctor
 $FUNCTION doctor_builtin
 $SHORT_DOC doctor
 Diagnose Java, the SikuliX bridge, Screen Recording permission, and
-the macOS TCC responsible-process chain. Does not start the JVM.
-Useful when screen_* / app_activate fail without an obvious cause.
-Returns JSON; pipe through `jq` to read it.
+the macOS TCC responsible-process chain. Prints a sectioned report.
+Does not start the JVM. Useful when screen_* / app_activate fail
+without an obvious cause.
 $END
 int doctor_builtin (WORD_LIST *list) {
   return tai_holo_dispatch_tool ("doctor", list);
