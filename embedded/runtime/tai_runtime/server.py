@@ -98,9 +98,65 @@ def _get_bridge() -> BridgeClient:
             if _bridge is None:
                 tmp = BridgeClient()
                 tmp.start()
+                _start_stderr_drain(tmp)
                 atexit.register(tmp.stop)
                 _bridge = tmp
     return _bridge
+
+
+def _start_stderr_drain(bridge: BridgeClient) -> None:
+    """Pump the JVM/SikuliX subprocess's stderr to a log file (always)
+    and to tai's own stderr (when TAI_DEBUG_BRIDGE is set).
+
+    Why: holo.bridge captures the child's stderr via subprocess.PIPE
+    but only reads it in the error path. A `screen_move` hang on a
+    fresh Mac (Accessibility / TCC trouble, JVM startup error,
+    SikuliX init exception) swallows all of the diagnostic the JVM
+    actually printed. Draining to a log file means the user can
+    always check ~/Library/Caches/tai/bridge.log after the fact;
+    the env var also tees it live to the shell for active
+    debugging.
+    """
+    proc = getattr(bridge, "_proc", None)
+    if proc is None or proc.stderr is None:
+        return
+
+    log_path = _bridge_log_path()
+    debug_to_stderr = bool(os.environ.get("TAI_DEBUG_BRIDGE"))
+
+    def _pump() -> None:
+        try:
+            with open(log_path, "ab") as log:
+                while True:
+                    chunk = proc.stderr.readline()
+                    if not chunk:
+                        return
+                    log.write(chunk)
+                    log.flush()
+                    if debug_to_stderr:
+                        sys.stderr.buffer.write(b"[bridge] ")
+                        sys.stderr.buffer.write(chunk)
+                        sys.stderr.flush()
+        except Exception:
+            return
+
+    threading.Thread(target=_pump, daemon=True).start()
+    if debug_to_stderr:
+        print(
+            f"[bridge] TAI_DEBUG_BRIDGE on — tee'ing JVM stderr; "
+            f"log also at {log_path}",
+            file=sys.stderr, flush=True,
+        )
+
+
+def _bridge_log_path() -> str:
+    home = os.environ.get("HOME") or "/tmp"
+    cache = os.path.join(home, "Library", "Caches", "tai")
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        cache = "/tmp"
+    return os.path.join(cache, "bridge.log")
 
 
 def _get_templates() -> TemplateStore:
@@ -285,12 +341,161 @@ def screen_user_capture(
         "Diagnose the tai/tcsh runtime: Java, SikuliX bridge, "
         "Screen Recording (via window-title readability), the TCC "
         "responsible-process chain, and bundle-vs-dev-tree state. "
-        "Does NOT start the JVM bridge (cheap to run). Returns a dict; "
-        "use `holo doctor | jq` to read it from the shell."
+        "Does NOT start the JVM bridge (cheap to run). Returns a "
+        "single human-readable report string (printed verbatim from "
+        "the shell builtin; agents should display it to the user)."
     )
 )
-def doctor() -> dict[str, Any]:
-    return _run_doctor()
+def doctor() -> str:
+    return _format_doctor(_run_doctor())
+
+
+def _format_doctor(d: dict[str, Any]) -> str:
+    """Render the doctor dict as a sectioned scannable report."""
+    lines: list[str] = []
+    holo_v = d["versions"].get("holo", "?")
+    lines.append(f"tai doctor — holo {holo_v}")
+    lines.append("")
+
+    # Platform / Python
+    plat = d["platform"]
+    py = d["python"]
+    lines.append("Runtime")
+    lines.append(
+        f"  Platform        : {plat['system']} {plat['machine']}"
+        + (f" ({plat['release']})" if plat.get("release") else "")
+    )
+    lines.append(
+        f"  Python          : {py['version']}  ({py['executable']})"
+    )
+    lines.append("")
+
+    # Java
+    lines.append("Java")
+    j = d["java"]
+    if j.get("available"):
+        lines.append(f"  ✓ {j.get('version', '?')}")
+        lines.append(f"    path: {j.get('path')}")
+    else:
+        lines.append("  ✗ NOT FOUND")
+        if j.get("hint"):
+            for hl in _wrap(j["hint"], 4):
+                lines.append(hl)
+    lines.append("")
+
+    # SikuliX / bridge
+    lines.append("SikuliX bundle")
+    for name, label in (("HOLO_SIKULI_JAR", "Jar"),
+                        ("HOLO_BRIDGE_SCRIPT", "Bridge script")):
+        info = d["env"].get(name, {})
+        if info.get("set") and info.get("exists"):
+            lines.append(
+                f"  ✓ {label:<14}: {_humansize(info.get('size_bytes') or 0)}"
+                f"  ({info.get('value', '?')})"
+            )
+        elif info.get("set"):
+            lines.append(f"  ✗ {label}: missing at {info.get('value')}")
+        else:
+            lines.append(f"  ✗ {label}: env var not set")
+    lines.append("")
+
+    # Screen Recording
+    sr = d["screen_recording"]
+    lines.append("Screen Recording permission")
+    if not sr.get("queryable"):
+        lines.append(f"  ? could not query: {sr.get('error')}")
+    else:
+        vis = sr.get("visible_windows", 0)
+        rdb = sr.get("with_readable_titles", 0)
+        marker = "✓" if rdb >= 3 else "✗"
+        lines.append(
+            f"  {marker} {rdb}/{vis} windows have readable titles"
+        )
+        for hl in _wrap(sr.get("hint", ""), 4):
+            lines.append(hl)
+    lines.append("")
+
+    # TCC responsible process — the most actionable section.
+    tcc = d["tcc_chain"]
+    likely = tcc.get("likely_tcc_responsible")
+    lines.append("TCC responsible process")
+    if likely:
+        # Truncate the path to a friendlier app name where possible
+        app_name = _app_label(likely)
+        lines.append(f"  → {app_name}")
+        lines.append(f"    full path: {likely}")
+    else:
+        lines.append("  → none found in launch chain")
+    for hl in _wrap(tcc.get("hint", ""), 4):
+        lines.append(hl)
+    lines.append("")
+
+    if tcc.get("chain"):
+        lines.append("Process chain (deepest last)")
+        for entry in tcc["chain"]:
+            lines.append(f"  {entry['pid']:>7}  {entry['name']}")
+        lines.append("")
+
+    # Verdict
+    summary = d.get("summary") or ["(no summary)"]
+    lines.append("Verdict")
+    for s in summary:
+        marker = "✗" if s != "All baseline checks pass." else "✓"
+        for hl in _wrap(s, 4, first_marker=marker):
+            lines.append(hl)
+
+    return "\n".join(lines)
+
+
+def _wrap(text: str, indent: int, first_marker: str | None = None,
+          width: int = 78) -> list[str]:
+    """Word-wrap `text` to `width`, prefixed by `indent` spaces. If
+    `first_marker` is set, the first line gets `  <marker> ` before
+    indent (so it visually aligns with other markers).
+
+    Long unbroken tokens (file paths, URLs) stay on one line — we'd
+    rather overflow the column than insert mid-path line breaks
+    that make the output unreadable."""
+    if not text:
+        return []
+    import textwrap
+    pad = " " * indent
+    wrapped = textwrap.wrap(
+        text,
+        width=width - indent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if not wrapped:
+        return []
+    out = []
+    if first_marker:
+        marker_prefix = f"  {first_marker} "
+        out.append(marker_prefix + wrapped[0])
+        for w in wrapped[1:]:
+            out.append(" " * len(marker_prefix) + w)
+    else:
+        for w in wrapped:
+            out.append(pad + w)
+    return out
+
+
+def _humansize(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _app_label(path: str) -> str:
+    """`/Applications/Foo.app/Contents/MacOS/Foo` -> `Foo.app`."""
+    import os
+    parts = path.split("/")
+    for p in parts:
+        if p.endswith(".app"):
+            return p
+    return os.path.basename(path)
 
 
 def _run_doctor() -> dict[str, Any]:
