@@ -43,10 +43,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# --- Pinned SikuliX release ----------------------------------------------
-# Mirror of the upstream SikuliX 2.0.5 IDE jar, hosted on our own GitHub
-# Releases so version drift is our call. `holo install-bridge` and the
-# auto-download path both fetch this exact URL and verify the digest.
+# --- Pinned SikuliX IDE release (used by `holo ide`) ---------------------
+# Mirror of the upstream SikuliX 2.0.5 IDE jar. The full IDE distribution
+# bundles Jython 2.7 and a GUI; `holo ide` invokes it as
+# `java -jar sikulixide.jar` to give the user the SikuliX IDE window.
+# NOT used by BridgeClient anymore (see SIKULI_API_JAR_* below) — the
+# IDE main triggers HotkeyManager init which hangs on macOS 15+ Carbon.
 SIKULI_VERSION: str = "2.0.5"
 SIKULI_JAR_NAME: str = "sikulixide-2.0.5.jar"
 SIKULI_JAR_URL: str = (
@@ -57,6 +59,47 @@ SIKULI_JAR_SHA256: str = (
     "f4b0b50c8e413094e78cd1d8fed02ae65f62f8c53ed00da0562fdedf4acff729"
 )
 SIKULI_JAR_BYTES: int = 128_949_200
+
+# --- Pinned SikuliX API release (used by BridgeClient) -------------------
+# The macOS-specific API-only jar from the oculix-org fork — same SikuliX
+# 2.0.5 code as upstream, repackaged per-platform. NO IDE classes, NO
+# HotkeyManager, NO Carbon dependency. Driven directly by standalone
+# Jython (see JYTHON_JAR_* below). This is what `BridgeClient.start()`
+# spawns.
+#
+# Path A in the v0.1.0a33 macOS-15 debugging session: oculix-org's IDE
+# repack hung the same way. Path B — Jython-direct against the API jar
+# — proved out cleanly (ping roundtrip <1 s, zero stderr, zero
+# HotkeyManager init). See the `fix/sikuli-api-bridge` PR for the
+# debugging story. URLs point at upstream releases for now; mirror to
+# holo's own release surface as a follow-up.
+# TODO: linux/windows variants — sikulixapi-2.0.5-linux.jar and
+# sikulixapi-2.0.5-windows.jar exist at the same release.
+SIKULI_API_JAR_NAME: str = "sikulixapi-2.0.5-macos.jar"
+SIKULI_API_JAR_URL: str = (
+    "https://github.com/oculix-org/SikuliX1/releases/download/"
+    "v2.0.5/sikulixapi-2.0.5-macos.jar"
+)
+SIKULI_API_JAR_SHA256: str = (
+    "6a486167696280b4601bd7cf1ec7c4669da696403c05cc9bda7f478507aac769"
+)
+SIKULI_API_JAR_BYTES: int = 83_177_290
+
+# --- Pinned standalone Jython (used by BridgeClient) ---------------------
+# Jython 2.7.4 standalone jar from Maven Central. Self-contained Python
+# 2.7 interpreter that runs on the JVM. Pairs with sikulixapi.jar on the
+# classpath; together they replicate what `sikulixide.jar -r script.py`
+# does, minus the IDE main and HotkeyManager.
+JYTHON_VERSION: str = "2.7.4"
+JYTHON_JAR_NAME: str = "jython-standalone-2.7.4.jar"
+JYTHON_JAR_URL: str = (
+    "https://repo1.maven.org/maven2/org/python/jython-standalone/"
+    "2.7.4/jython-standalone-2.7.4.jar"
+)
+JYTHON_JAR_SHA256: str = (
+    "1fba1769effcc8b19f5e10436bc8274a158ce988559f257927c24c73bb137f3c"
+)
+JYTHON_JAR_BYTES: int = 50_453_449
 
 
 class BridgeError(RuntimeError):
@@ -83,7 +126,14 @@ class BridgeClient:
     for the life of the daemon.
     """
 
-    jar_path: Path | None = None
+    # Per-instance overrides. `api_jar_path` + `jython_jar_path` are
+    # the bridge's actual jars (used together on the classpath). The
+    # legacy `jar_path` kwarg is accepted for back-compat but ONLY as
+    # a fallback for `api_jar_path` if the latter isn't set; callers
+    # that explicitly want the API jar should use the new field.
+    api_jar_path: Path | None = None
+    jython_jar_path: Path | None = None
+    jar_path: Path | None = None  # legacy alias for api_jar_path
     script_path: Path | None = None
     java_path: str = "java"
     extra_jvm_args: tuple[str, ...] = ()
@@ -93,21 +143,34 @@ class BridgeClient:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def start(self) -> None:
-        """Spawn the JVM subprocess and run a `ping` to confirm liveness."""
+        """Spawn the JVM subprocess and run a `ping` to confirm liveness.
+
+        Invocation: standalone Jython on the classpath with sikulixapi —
+        NOT the IDE jar's `-r script.py` flag. The IDE main triggers
+        HotkeyManager init which hangs on macOS 15+ (jkeymaster's
+        Carbon hotkey provider blocks forever during cleanup).
+        Direct-Jython skips that whole chain.
+
+            java -cp api.jar:jython.jar org.python.util.jython bridge.py
+
+        bridge.py defaults its transport to stdio, so no extra args.
+        """
         if self._proc is not None:
             return
-        jar = self._resolve_jar()
+        api_jar = self._resolve_api_jar()
+        jython_jar = self._resolve_jython_jar()
         script = self._resolve_script()
+        # `:` is the JVM's classpath separator on POSIX. Windows would
+        # use `;`; not relevant until we ship a non-macOS API jar
+        # (see TODO on SIKULI_API_JAR_NAME).
+        classpath = f"{api_jar}{os.pathsep}{jython_jar}"
         cmd = [
             self.java_path,
             *self.extra_jvm_args,
-            "-jar",
-            str(jar),
-            "-r",
+            "-cp",
+            classpath,
+            "org.python.util.jython",
             str(script),
-            "--",
-            "--transport",
-            "stdio",
         ]
         self._proc = subprocess.Popen(
             cmd,
@@ -382,6 +445,56 @@ class BridgeClient:
         # Last resort: download from the pinned release into the cache.
         return ensure_jar()
 
+    def _resolve_api_jar(self) -> Path:
+        """Locate the SikuliX *API* jar — the one BridgeClient actually
+        spawns. Search order mirrors `_resolve_jar`:
+
+            1. Explicit `api_jar_path` kwarg
+            2. Legacy `jar_path` kwarg (back-compat with pre-fix callers
+               that didn't know about the api/ide split)
+            3. `HOLO_SIKULI_API_JAR` env var, else legacy `HOLO_SIKULI_JAR`
+            4. PyInstaller / repo-root / user-cache filesystem search for
+               sikulixapi*.jar
+            5. Download from the pinned URL into the user cache
+        """
+        if self.api_jar_path is not None:
+            return _require(Path(self.api_jar_path), "sikulixapi jar")
+        if self.jar_path is not None:
+            return _require(Path(self.jar_path), "sikulixapi jar (legacy `jar_path` kwarg)")
+        env = (
+            os.environ.get("HOLO_SIKULI_API_JAR")
+            or os.environ.get("HOLO_SIKULI_JAR")
+        )
+        if env:
+            return _require(Path(env), "sikulixapi jar (env)")
+        for candidate in _candidate_api_jar_paths():
+            if candidate.exists():
+                return candidate
+        if os.environ.get("HOLO_BRIDGE_NO_DOWNLOAD") == "1":
+            raise BridgeMissingError(
+                "sikulixapi jar not found and HOLO_BRIDGE_NO_DOWNLOAD=1. "
+                "Drop sikulixapi-*.jar in vendor/ or set HOLO_SIKULI_API_JAR."
+            )
+        return ensure_api_jar()
+
+    def _resolve_jython_jar(self) -> Path:
+        """Locate the standalone Jython jar (paired with sikulixapi on
+        the classpath). Same search order shape as `_resolve_api_jar`."""
+        if self.jython_jar_path is not None:
+            return _require(Path(self.jython_jar_path), "jython-standalone jar")
+        env = os.environ.get("HOLO_JYTHON_JAR")
+        if env:
+            return _require(Path(env), "jython-standalone jar (HOLO_JYTHON_JAR)")
+        for candidate in _candidate_jython_jar_paths():
+            if candidate.exists():
+                return candidate
+        if os.environ.get("HOLO_BRIDGE_NO_DOWNLOAD") == "1":
+            raise BridgeMissingError(
+                "jython-standalone jar not found and HOLO_BRIDGE_NO_DOWNLOAD=1. "
+                "Drop jython-standalone-*.jar in vendor/ or set HOLO_JYTHON_JAR."
+            )
+        return ensure_jython_jar()
+
     def _resolve_script(self) -> Path:
         if self.script_path is not None:
             return _require(Path(self.script_path), "bridge.py")
@@ -416,16 +529,38 @@ def _repo_root() -> Path:
 
 
 def _candidate_jar_paths() -> list[Path]:
-    """Search order for the SikuliX jar.
+    """Search order for any SikuliX jar (legacy resolver used by `holo
+    ide` etc., which doesn't care which jar shape it gets).
 
-    Both `sikulixapi-*.jar` (headless API) and `sikulixide-*.jar` (IDE
-    distribution that bundles the API) work — `java -jar X -r script.py`
-    accepts either. Prefer the slimmer api jar when both are present.
+    Both `sikulixapi-*.jar` (headless API) and `sikulixide-*.jar` (full
+    IDE) are accepted here. Prefer the slimmer api jar when both are
+    present.
     """
     out: list[Path] = []
     for base in _jar_search_dirs():
         for pattern in ("sikulixapi*.jar", "sikulixide*.jar"):
             out.extend(sorted(base.glob(pattern)))
+    return out
+
+
+def _candidate_api_jar_paths() -> list[Path]:
+    """Search order specifically for the SikuliX API jar that
+    `BridgeClient.start()` spawns. Filters to `sikulixapi*.jar` so the
+    bridge never tries to run the IDE jar (which triggers the macOS-15
+    Carbon hang). If only the IDE jar is on disk, the user gets a
+    clean BridgeMissingError + download fallback instead of a
+    confusing runtime hang.
+    """
+    out: list[Path] = []
+    for base in _jar_search_dirs():
+        out.extend(sorted(base.glob("sikulixapi*.jar")))
+    return out
+
+
+def _candidate_jython_jar_paths() -> list[Path]:
+    out: list[Path] = []
+    for base in _jar_search_dirs():
+        out.extend(sorted(base.glob("jython-standalone-*.jar")))
     return out
 
 
@@ -484,39 +619,84 @@ def ensure_jar(
     cache_dir: Path | None = None,
     on_progress: Any = None,
 ) -> Path:
-    """Return the cached SikuliX jar path, downloading it if missing.
+    """Return the cached SikuliX *IDE* jar path, downloading if missing.
 
-    Verifies the SHA-256 digest after download (and re-downloads if a
-    cached copy's digest doesn't match the pinned value — corrupted
-    download or mismatched version). Idempotent: subsequent calls
-    return immediately when the cached file is already valid.
-
-    `on_progress` is an optional callable `(bytes_read, total_bytes)`
-    invoked during download for progress reporting (used by
-    `holo install-bridge`).
+    Used by `holo ide` (which launches the SikuliX IDE GUI).
+    BridgeClient uses `ensure_api_jar` + `ensure_jython_jar` instead.
     """
+    return _ensure_artifact(
+        name=SIKULI_JAR_NAME,
+        url=SIKULI_JAR_URL,
+        sha256=SIKULI_JAR_SHA256,
+        cache_dir=cache_dir,
+        on_progress=on_progress,
+    )
+
+
+def ensure_api_jar(
+    *,
+    cache_dir: Path | None = None,
+    on_progress: Any = None,
+) -> Path:
+    """Return the cached SikuliX *API* jar path, downloading if missing.
+
+    Paired with `ensure_jython_jar` — together they're what
+    BridgeClient spawns. NOT a substitute for `ensure_jar` (the IDE
+    jar): the API jar has no main class.
+    """
+    return _ensure_artifact(
+        name=SIKULI_API_JAR_NAME,
+        url=SIKULI_API_JAR_URL,
+        sha256=SIKULI_API_JAR_SHA256,
+        cache_dir=cache_dir,
+        on_progress=on_progress,
+    )
+
+
+def ensure_jython_jar(
+    *,
+    cache_dir: Path | None = None,
+    on_progress: Any = None,
+) -> Path:
+    """Return the cached standalone Jython jar path, downloading if missing."""
+    return _ensure_artifact(
+        name=JYTHON_JAR_NAME,
+        url=JYTHON_JAR_URL,
+        sha256=JYTHON_JAR_SHA256,
+        cache_dir=cache_dir,
+        on_progress=on_progress,
+    )
+
+
+def _ensure_artifact(
+    *,
+    name: str,
+    url: str,
+    sha256: str,
+    cache_dir: Path | None,
+    on_progress: Any,
+) -> Path:
+    """Generic cached-download-with-digest-verify. Idempotent."""
     cache = cache_dir if cache_dir is not None else _user_cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / SIKULI_JAR_NAME
+    target = cache / name
 
     if target.exists():
-        if _sha256(target) == SIKULI_JAR_SHA256:
+        if _sha256(target) == sha256:
             return target
-        # Stale or corrupted — drop and re-download.
         target.unlink(missing_ok=True)
 
     tmp = target.with_suffix(target.suffix + ".part")
     try:
-        _download(SIKULI_JAR_URL, tmp, on_progress=on_progress)
+        _download(url, tmp, on_progress=on_progress)
         digest = _sha256(tmp)
-        if digest != SIKULI_JAR_SHA256:
+        if digest != sha256:
             raise BridgeMissingError(
-                f"SHA-256 mismatch for {SIKULI_JAR_URL}: "
-                f"expected {SIKULI_JAR_SHA256}, got {digest}"
+                f"SHA-256 mismatch for {url}: "
+                f"expected {sha256}, got {digest}"
             )
         tmp.replace(target)
     finally:
-        # If the download or verification failed, leave nothing partial.
         if tmp.exists():
             tmp.unlink(missing_ok=True)
     return target
@@ -544,7 +724,9 @@ def _download(url: str, dest: Path, *, on_progress: Any = None) -> None:
     try:
         ctx = _ssl_context()
         with urllib.request.urlopen(url, context=ctx) as response:  # noqa: S310 (pinned URL)
-            total = int(response.headers.get("Content-Length") or 0) or SIKULI_JAR_BYTES
+            # Falls back to 0 when the server omits Content-Length;
+            # on_progress callers all handle a zero total gracefully.
+            total = int(response.headers.get("Content-Length") or 0)
             with open(dest, "wb") as out:
                 read = 0
                 while True:

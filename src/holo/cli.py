@@ -557,49 +557,67 @@ def _cmd_screen(rest: list[str]) -> int:
 
 
 def _cmd_install_screen() -> int:
-    """Pre-download the SikuliX jar into the user cache.
+    """Pre-download the bridge dependencies into the user cache.
 
-    Useful in air-gapped / metered-bandwidth environments where you want
-    to stage the jar up front rather than letting the daemon fetch it on
-    first run. Idempotent: if the cached file is already valid, exits
-    immediately.
+    Bridge dependencies: `sikulixapi-*.jar` (SikuliX API; the API-only
+    jar with no IDE / HotkeyManager / Carbon code) and
+    `jython-standalone-*.jar` (standalone Jython 2.7, used directly via
+    classpath instead of through the IDE's `-r` flag — see the
+    fix/sikuli-api-bridge PR for the macOS 15 Carbon-hang context).
+
+    Does NOT download the SikuliX IDE jar (`sikulixide-*.jar`); that's
+    only needed by `holo ide` and downloads itself on first use.
+
+    Useful in air-gapped / metered-bandwidth environments where you
+    want to stage the jars up front rather than letting the daemon
+    fetch them on first run. Idempotent.
     """
     from holo.bridge import (
-        SIKULI_JAR_BYTES,
-        SIKULI_JAR_NAME,
-        SIKULI_JAR_URL,
+        JYTHON_JAR_BYTES,
+        JYTHON_JAR_NAME,
+        JYTHON_JAR_URL,
+        SIKULI_API_JAR_BYTES,
+        SIKULI_API_JAR_NAME,
+        SIKULI_API_JAR_URL,
         BridgeMissingError,
-        ensure_jar,
+        ensure_api_jar,
+        ensure_jython_jar,
     )
 
-    print(f"holo install-screen — fetching {SIKULI_JAR_NAME}")
-    print(f"  source: {SIKULI_JAR_URL}")
+    def _fetch(label, name, url, ensure, expected_bytes):
+        print(f"holo install-screen — fetching {name}  ({label})")
+        print(f"  source: {url}")
+        last_pct = {"value": -1}
 
-    last_pct = {"value": -1}
+        def on_progress(read: int, total: int) -> None:
+            if not total:
+                return
+            pct = int(100 * read / total)
+            if pct != last_pct["value"]:
+                last_pct["value"] = pct
+                sys.stdout.write(
+                    f"\r  progress: {pct:3d}%  ({read / 1_048_576:.1f} / "
+                    f"{total / 1_048_576:.1f} MiB)"
+                )
+                sys.stdout.flush()
 
-    def on_progress(read: int, total: int) -> None:
-        if not total:
-            return
-        pct = int(100 * read / total)
-        if pct != last_pct["value"]:
-            last_pct["value"] = pct
-            sys.stdout.write(
-                f"\r  progress: {pct:3d}%  ({read / 1_048_576:.1f} / "
-                f"{total / 1_048_576:.1f} MiB)"
-            )
-            sys.stdout.flush()
+        try:
+            path = ensure(on_progress=on_progress)
+        finally:
+            if last_pct["value"] >= 0:
+                print()
+        print(f"  ✓ cached at {path}")
+        print(f"    size: {path.stat().st_size} bytes (pinned: {expected_bytes})")
+        return path
 
     try:
-        path = ensure_jar(on_progress=on_progress)
+        _fetch("SikuliX API", SIKULI_API_JAR_NAME, SIKULI_API_JAR_URL,
+               ensure_api_jar, SIKULI_API_JAR_BYTES)
+        _fetch("Jython runtime", JYTHON_JAR_NAME, JYTHON_JAR_URL,
+               ensure_jython_jar, JYTHON_JAR_BYTES)
     except BridgeMissingError as e:
-        print()
         print(f"holo install-screen: {e}", file=sys.stderr)
         return 1
-    finally:
-        if last_pct["value"] >= 0:
-            print()
-    print(f"✓ cached at {path}")
-    print(f"  size:   {path.stat().st_size} bytes (pinned: {SIKULI_JAR_BYTES})")
     return 0
 
 
