@@ -47,14 +47,68 @@ tai_is_user_shell_name (const char *argv0)
   return strcmp (tai_basename (argv0), "tai") == 0;
 }
 
+/* `tcsh` accepts a small CLI surface:
+     --listen PORT       — serve MCP over TCP instead of stdio
+     --bind ADDR         — bind address for --listen (default 127.0.0.1)
+     --token TOKEN       — require this token in the handshake
+     --help              — print usage and exit
+
+   These flags are PARSED ONLY IN tcsh MODE. argv[0]=tai never enters
+   this function (it routes through shell.c → bash main), and any
+   other name routes through plain bash; so the user shell and bash
+   never see these flag names.
+
+   Without --listen, behaviour is unchanged — stdio MCP for
+   spawned-child use (Claude Code's `command` MCP server entry). */
 int
 tai_control_shell_main (int argc, char **argv)
 {
-  /* Positional args are discarded per design (the name is the whole
-     signal). Hand off to the embedded-Python serve loop. */
-  (void) argc;
-  (void) argv;
-  return tai_embedded_serve_stdio ();
+  int port = 0;
+  const char *bind_addr = NULL;	/* NULL → 127.0.0.1 in serve_tcp */
+  const char *token = NULL;
+
+  for (int i = 1; i < argc; i++)
+    {
+      const char *arg = argv[i];
+      if (strcmp (arg, "--help") == 0 || strcmp (arg, "-h") == 0)
+	{
+	  fprintf (stderr,
+		   "Usage: tcsh [--listen PORT [--bind ADDR] [--token T]]\n"
+		   "\n"
+		   "With no flags: serve MCP over stdio (default).\n"
+		   "With --listen PORT: serve a single TCP connection.\n"
+		   "  --bind ADDR     bind address (default 127.0.0.1)\n"
+		   "  --token TOKEN   require this token in the handshake\n"
+		   "\n"
+		   "Wire format for --listen connect:\n"
+		   "  client → TAI/1\\n\n"
+		   "  client → <token>\\n   (only when --token is set)\n"
+		   "  server → OK\\n        (then MCP framing begins)\n");
+	  return 0;
+	}
+      if (strcmp (arg, "--listen") == 0 && i + 1 < argc)
+	{
+	  port = atoi (argv[++i]);
+	  continue;
+	}
+      if (strcmp (arg, "--bind") == 0 && i + 1 < argc)
+	{
+	  bind_addr = argv[++i];
+	  continue;
+	}
+      if (strcmp (arg, "--token") == 0 && i + 1 < argc)
+	{
+	  token = argv[++i];
+	  continue;
+	}
+      fprintf (stderr, "tcsh: unknown argument '%s' (try --help)\n", arg);
+      return 64;	/* EX_USAGE */
+    }
+
+  if (port == 0)
+    return tai_embedded_serve_stdio ();
+
+  return tai_embedded_serve_tcp (bind_addr, port, token);
 }
 
 /* Prefix-based identification of the holo-builtin family. Simpler

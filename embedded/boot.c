@@ -10,13 +10,18 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <arpa/inet.h>
+#include <errno.h>
 #include <libgen.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "boot.h"
 #include "extract.h"
@@ -346,4 +351,159 @@ tai_embedded_serve_stdio (void)
     }
 
   return (int) exit_code;
+}
+
+/* ----------- --listen support (TCP transport for tcsh) ------------ */
+
+/* Read a single newline-terminated line into `buf`. Caps at `max - 1`
+   bytes (always leaves room for a trailing NUL). Returns the number
+   of bytes read NOT including the newline, or -1 on EOF / error /
+   line too long. */
+static ssize_t
+_read_line (int fd, char *buf, size_t max)
+{
+  size_t i = 0;
+  while (i < max - 1)
+    {
+      char c;
+      ssize_t r = read (fd, &c, 1);
+      if (r <= 0)
+	return -1;
+      if (c == '\n')
+	{
+	  buf[i] = '\0';
+	  return (ssize_t) i;
+	}
+      buf[i++] = c;
+    }
+  /* Line too long — bail out before the client can fill memory. */
+  return -1;
+}
+
+/* Drain "TAI/1\n[<token>\n]" from the client. Returns 0 on success,
+   -1 on any deviation. Sends a short reason to stderr on failure
+   so the operator can see why a connection was rejected without
+   needing to attach a debugger. */
+static int
+_validate_handshake (int fd, const char *expected_token)
+{
+  char buf[256];
+
+  ssize_t n = _read_line (fd, buf, sizeof buf);
+  if (n < 0 || strcmp (buf, "TAI/1") != 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: bad magic prefix\n");
+      return -1;
+    }
+
+  if (expected_token != NULL)
+    {
+      n = _read_line (fd, buf, sizeof buf);
+      if (n < 0)
+	{
+	  fprintf (stderr, "tai: tcsh --listen: missing token line\n");
+	  return -1;
+	}
+      if (strcmp (buf, expected_token) != 0)
+	{
+	  fprintf (stderr, "tai: tcsh --listen: token mismatch\n");
+	  return -1;
+	}
+    }
+  return 0;
+}
+
+int
+tai_embedded_serve_tcp (const char *bind_addr, int port,
+			const char *token)
+{
+  if (port <= 0 || port > 65535)
+    {
+      fprintf (stderr, "tai: tcsh --listen: invalid port %d\n", port);
+      return 70;
+    }
+  if (bind_addr == NULL)
+    bind_addr = "127.0.0.1";
+
+  int listen_fd = socket (AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: socket: %s\n",
+	       strerror (errno));
+      return 70;
+    }
+
+  int yes = 1;
+  setsockopt (listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+
+  struct sockaddr_in addr;
+  memset (&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons ((uint16_t) port);
+  if (inet_pton (AF_INET, bind_addr, &addr.sin_addr) != 1)
+    {
+      fprintf (stderr, "tai: tcsh --listen: invalid bind address %s\n",
+	       bind_addr);
+      close (listen_fd);
+      return 70;
+    }
+
+  if (bind (listen_fd, (struct sockaddr *) &addr, sizeof addr) < 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: bind %s:%d: %s\n",
+	       bind_addr, port, strerror (errno));
+      close (listen_fd);
+      return 70;
+    }
+  if (listen (listen_fd, 1) < 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: listen: %s\n",
+	       strerror (errno));
+      close (listen_fd);
+      return 70;
+    }
+
+  /* Diagnostic only — written to stderr so it doesn't contaminate
+     the stdio MCP channel a parent (e.g. an SSH session shovelling
+     bytes to/from a remote nc) might be reading. */
+  fprintf (stderr,
+	   "tai: tcsh listening on %s:%d (single connection)%s\n",
+	   bind_addr, port,
+	   token ? " — token required" : "");
+
+  int conn_fd = accept (listen_fd, NULL, NULL);
+  if (conn_fd < 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: accept: %s\n",
+	       strerror (errno));
+      close (listen_fd);
+      return 70;
+    }
+  close (listen_fd);
+
+  if (_validate_handshake (conn_fd, token) != 0)
+    {
+      const char *err = "ERR bad handshake\n";
+      (void) write (conn_fd, err, strlen (err));
+      close (conn_fd);
+      return 70;
+    }
+  (void) write (conn_fd, "OK\n", 3);
+
+  /* dup2 the connection over fd 0 and fd 1. Python's stdin/stdout
+     are bound during Py_InitializeFromConfig (called later by
+     tai_embedded_serve_stdio → tai_embedded_ensure_ready), so this
+     MUST happen first or the interpreter will grab the original
+     terminal/pipe and the dup happens too late. */
+  if (dup2 (conn_fd, 0) < 0 || dup2 (conn_fd, 1) < 0)
+    {
+      fprintf (stderr, "tai: tcsh --listen: dup2: %s\n",
+	       strerror (errno));
+      close (conn_fd);
+      return 70;
+    }
+  if (conn_fd > 2)
+    close (conn_fd);
+
+  return tai_embedded_serve_stdio ();
 }

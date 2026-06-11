@@ -22,6 +22,29 @@
    the desired process exit code. */
 extern int tai_embedded_serve_stdio (void);
 
+/* Same loop, but reachable over a single TCP connection on
+   bind_addr:port. Single-shot: accept one client, run the magic-
+   prefix + optional-token handshake, dup2 the connection over
+   fd 0/1, hand off to tai_embedded_serve_stdio(). When the client
+   disconnects the process exits.
+
+   Used only by `tcsh --listen PORT [--bind ADDR] [--token T]`.
+   bind_addr defaults to "127.0.0.1" at the caller. token may be
+   NULL — in which case the handshake only checks the magic
+   prefix. The wire format on connect:
+
+       client → TAI/1\n
+       client → <token>\n          (only when token != NULL)
+       server → OK\n               (or "ERR <reason>\n" + close)
+       … MCP framing continues as if it were stdio …
+
+   Returns the same exit code shape as tai_embedded_serve_stdio
+   (70 on infrastructure errors, otherwise the Python loop's
+   return). */
+extern int tai_embedded_serve_tcp (const char *bind_addr,
+				   int port,
+				   const char *token);
+
 /* Initialize the embedded Python runtime if it isn't already up.
    Returns 0 on success (Python ready, tai_runtime importable),
    -1 on failure (diagnostic already written to stderr). Idempotent
