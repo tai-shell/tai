@@ -391,12 +391,14 @@ def cleanup_remote(target: str) -> None:
     but not fatal — leftover bytes on the remote are not worth
     failing the session over.
 
-    By the time this runs, tcsh has exited (single-connection
-    design: it exits when the client disconnects, which is exactly
-    when relay() returns). The atexit chain inside tcsh stops the
-    SikuliX JVM bridge before tcsh dies, so no live process is
-    holding the cache dir open. Even if it were — Unix rm doesn't
-    care; the inodes free when the last fd closes.
+    The single-connection listener is *supposed* to exit when the
+    client disconnects, but on a SIGTERM/SIGINT exit that teardown
+    races the tunnel close and the listener (plus the SikuliX JVM it
+    spawned) can survive — observed holding /tmp/tcsh and the cache
+    dir open after a CLI exit. So we pkill both before removing files
+    rather than assuming they're already gone. Unix rm wouldn't care
+    about open fds, but a live listener would keep re-touching the
+    log and leave a process running on the remote.
 
     Set MCP_BRIDGE_KEEP_TRACES=1 in env to skip cleanup for
     debugging (preserve logs etc. on the remote for inspection)."""
@@ -406,10 +408,14 @@ def cleanup_remote(target: str) -> None:
         return
 
     sys.stderr.write(f"mcp-bridge: wiping {target} (agentless cleanup)\n")
-    # Single shell command so we only pay one ssh round-trip. `rm`s
-    # are tolerant of missing files; the rm -rf of the cache dir
-    # cleans up any extracted-payload subdirs in one shot.
+    # Single shell command so we only pay one ssh round-trip. Kill the
+    # listener + any SikuliX JVM first (best-effort; pkill is fine if
+    # they already exited), then remove files. `rm`s tolerate missing
+    # files; the rm -rf of the cache dir cleans up any extracted-payload
+    # subdirs in one shot.
     cmd = (
+        f"pkill -f '^{DEFAULT_REMOTE_TCSH_LINK} --listen' 2>/dev/null; "
+        f"pkill -f sikulixapi 2>/dev/null; "
         f"rm -f {DEFAULT_REMOTE_BINARY_PATH} {DEFAULT_REMOTE_TCSH_LINK} "
         f"{DEFAULT_REMOTE_LAUNCHER_PATH} {DEFAULT_TOKEN_PATH} "
         f"{DEFAULT_REMOTE_LOG_PATH}; "
@@ -453,15 +459,33 @@ def main() -> None:
     # Step 4: tunnel.
     tunnel = open_tunnel(target, port)
 
-    def cleanup(*_: object) -> None:
+    # Teardown is shared between the signal handler and the `finally`
+    # below; the flag makes it run exactly once. The previous handler
+    # called os._exit(0) directly, which skipped the `finally` and so
+    # never ran cleanup_remote — and Claude Code stops the MCP server
+    # with SIGTERM, not a clean stdin EOF, so that was the common path.
+    # Result: the remote binary/launcher/token/log + extracted cache and
+    # a still-live listener were orphaned on every normal exit.
+    teardown_done = {"yes": False}
+
+    def teardown() -> None:
+        if teardown_done["yes"]:
+            return
+        teardown_done["yes"] = True
         try:
             tunnel.terminate()
         except Exception:
             pass
+        # Wipe every trace of tai from the remote so leftover bytes can't
+        # accumulate across sessions / failed runs.
+        cleanup_remote(target)
+
+    def on_signal(*_: object) -> None:
+        teardown()
         os._exit(0)
 
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
 
     try:
         # Step 5: handshake.
@@ -473,14 +497,9 @@ def main() -> None:
         # Step 6: relay.
         relay(sock, primer)
     finally:
-        try:
-            tunnel.terminate()
-        except Exception:
-            pass
-        # Step 7: wipe every trace of tai from the remote. Runs
-        # even on abnormal exit so leftover bytes can't accumulate
-        # across sessions / failed runs.
-        cleanup_remote(target)
+        # Step 7 — runs on clean EOF exit; the signal handler covers the
+        # SIGTERM/SIGINT paths. The shared flag prevents a double wipe.
+        teardown()
 
 
 if __name__ == "__main__":
