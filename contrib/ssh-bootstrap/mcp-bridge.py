@@ -52,8 +52,10 @@ import time
 DEFAULT_TOKEN_PATH = "/tmp/tai-token"
 DEFAULT_TAI_BINARY = "/usr/local/bin/tai"
 DEFAULT_REMOTE_BINARY_PATH = "/tmp/tai"
+DEFAULT_REMOTE_TCSH_LINK = "/tmp/tcsh"
 DEFAULT_REMOTE_LAUNCHER_PATH = "/tmp/launcher.command"
 DEFAULT_REMOTE_LOG_PATH = "/tmp/tai-listener.log"
+DEFAULT_REMOTE_CACHE_DIR = "~/Library/Caches/tai"
 
 TUNNEL_READY_TIMEOUT_S = 10.0
 LISTENER_READY_TIMEOUT_S = 10.0
@@ -85,6 +87,13 @@ def _scp(local: str, remote: str, *, timeout: float = 600.0) -> None:
         ["scp", "-o", "BatchMode=yes", "-q", local, remote],
         stdin=subprocess.DEVNULL, timeout=timeout, check=True,
     )
+
+
+def _sh_squote(s: str) -> str:
+    """Single-quote a string for safe interpolation into a sh -c
+    command. Single quotes inside the string are handled by closing,
+    inserting an escaped quote, and reopening."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _sha256(path: str) -> str:
@@ -143,6 +152,12 @@ def fire_listener(target: str, port: int) -> str:
         # Terminal.app's TCC permissions (Accessibility / Screen Recording).
         set -eu
 
+        # Bounds-snap + Terminal-hide are done by the SSH-side
+        # osascript that fired this script (single AppleScript
+        # block right after `do script`), so by the time we start
+        # running, the window's already offscreen and Terminal is
+        # invisible. Nothing to do here on that front.
+
         ln -sf {DEFAULT_REMOTE_BINARY_PATH} /tmp/tcsh
         printf '%s\\n' '{token}' > {DEFAULT_TOKEN_PATH}
         chmod 600 {DEFAULT_TOKEN_PATH}
@@ -158,8 +173,8 @@ def fire_listener(target: str, port: int) -> str:
             < /dev/null > {DEFAULT_REMOTE_LOG_PATH} 2>&1 &
         disown
 
-        # Auto-close THIS Terminal window after a beat. Background
-        # so it fires after this script's exit.
+        # Auto-close the (offscreen) Terminal window after a beat.
+        # Background so it fires after this script's exit.
         ( sleep 1 && \\
           osascript -e 'tell application "Terminal" to close (every window whose name contains "launcher")' \\
             >/dev/null 2>&1 ) &
@@ -181,9 +196,28 @@ def fire_listener(target: str, port: int) -> str:
              timeout=60.0)
         sys.stderr.write(
             "mcp-bridge: firing launcher inside Terminal.app on remote\n")
+        # Use osascript directly (not `open`) so the bounds-snap runs
+        # as the very next AppleScript statement after `do script`,
+        # with no `bash → osascript` startup gap in between. Then
+        # hide Terminal entirely via System Events so any stray
+        # window can't steal focus or remain on screen.
+        applescript_lines = [
+            'tell application "Terminal"',
+            f'  do script "{DEFAULT_REMOTE_LAUNCHER_PATH}"',
+            '  set bounds of front window to {-10000, -10000, -9900, -9900}',
+            'end tell',
+            'tell application "System Events"',
+            '  set visible of process "Terminal" to false',
+            'end tell',
+        ]
+        # Each AppleScript line as a separate -e arg. Single-quote
+        # each in the shell command; the script's literal { and }
+        # bounds-tuple braces are safe inside the single quotes.
+        ascript = " ".join(
+            "-e " + _sh_squote(line) for line in applescript_lines
+        )
         _ssh(target,
-             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && "
-             f"open {DEFAULT_REMOTE_LAUNCHER_PATH}",
+             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && osascript {ascript}",
              check=True)
     finally:
         os.unlink(local_launcher)
@@ -198,11 +232,33 @@ def fire_listener(target: str, port: int) -> str:
 
 
 def wait_for_listener(target: str) -> None:
+    """Poll the listener log on the remote for tcsh's bind banner.
+
+    Why not pgrep: pgrep returns success the moment tcsh's process
+    exec's, which is BEFORE the socket() → bind() → listen() chain
+    completes. A connection arriving during that window hits a
+    tcsh that's running but not yet in accept(), which manifests
+    as the bridge's sock.connect succeeding (ssh tunnel forwards
+    fine) but recv hitting RST a millisecond later when tcsh's
+    accept queue isn't there. Empirically observed against macOS
+    26 when the binary scp window pushes the timing into the bad
+    zone; a 3-second sleep after `open` was enough to dodge it.
+
+    The log banner ("tai: tcsh listening on 127.0.0.1:PORT ...")
+    is printed by tcsh's C code immediately after listen() returns
+    success — so its presence in the log is proof tcsh is ready
+    to accept. Cheap to check via ssh + grep.
+    """
     sys.stderr.write("mcp-bridge: waiting for tcsh listener to bind\n")
     deadline = time.time() + LISTENER_READY_TIMEOUT_S
     while time.time() < deadline:
-        r = _ssh(target, "pgrep -f '^/tmp/tcsh --listen'", timeout=5.0)
-        if r.returncode == 0 and r.stdout.strip():
+        r = _ssh(
+            target,
+            f"grep -q 'tcsh listening on' {DEFAULT_REMOTE_LOG_PATH} "
+            f"2>/dev/null && echo ready",
+            timeout=5.0,
+        )
+        if r.returncode == 0 and "ready" in r.stdout:
             return
         time.sleep(0.3)
     die(f"listener didn't appear on remote within "
@@ -321,6 +377,57 @@ def relay(sock: socket.socket, primer: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cleanup — wipe every trace of tai from the remote after the session.
+# ---------------------------------------------------------------------------
+
+
+def cleanup_remote(target: str) -> None:
+    """True agentless: remove the binary, launcher, token, log, the
+    /tmp/tcsh symlink, and the entire ~/Library/Caches/tai/ tree
+    (extracted bundle payloads + bridge.log + template cache).
+
+    Runs in main()'s finally so it fires even on abnormal exit. Best
+    effort: a network drop or SSH error during cleanup is logged
+    but not fatal — leftover bytes on the remote are not worth
+    failing the session over.
+
+    By the time this runs, tcsh has exited (single-connection
+    design: it exits when the client disconnects, which is exactly
+    when relay() returns). The atexit chain inside tcsh stops the
+    SikuliX JVM bridge before tcsh dies, so no live process is
+    holding the cache dir open. Even if it were — Unix rm doesn't
+    care; the inodes free when the last fd closes.
+
+    Set MCP_BRIDGE_KEEP_TRACES=1 in env to skip cleanup for
+    debugging (preserve logs etc. on the remote for inspection)."""
+    if os.environ.get("MCP_BRIDGE_KEEP_TRACES") == "1":
+        sys.stderr.write(
+            "mcp-bridge: cleanup skipped (MCP_BRIDGE_KEEP_TRACES=1)\n")
+        return
+
+    sys.stderr.write(f"mcp-bridge: wiping {target} (agentless cleanup)\n")
+    # Single shell command so we only pay one ssh round-trip. `rm`s
+    # are tolerant of missing files; the rm -rf of the cache dir
+    # cleans up any extracted-payload subdirs in one shot.
+    cmd = (
+        f"rm -f {DEFAULT_REMOTE_BINARY_PATH} {DEFAULT_REMOTE_TCSH_LINK} "
+        f"{DEFAULT_REMOTE_LAUNCHER_PATH} {DEFAULT_TOKEN_PATH} "
+        f"{DEFAULT_REMOTE_LOG_PATH}; "
+        f"rm -rf {DEFAULT_REMOTE_CACHE_DIR}"
+    )
+    try:
+        r = _ssh(target, cmd, timeout=30.0)
+        if r.returncode != 0:
+            sys.stderr.write(
+                f"mcp-bridge: cleanup partial (rc={r.returncode}): "
+                f"{(r.stderr or '').strip()}\n")
+        else:
+            sys.stderr.write("mcp-bridge: remote wiped clean\n")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write(f"mcp-bridge: cleanup ssh failed: {e}\n")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -370,6 +477,10 @@ def main() -> None:
             tunnel.terminate()
         except Exception:
             pass
+        # Step 7: wipe every trace of tai from the remote. Runs
+        # even on abnormal exit so leftover bytes can't accumulate
+        # across sessions / failed runs.
+        cleanup_remote(target)
 
 
 if __name__ == "__main__":
