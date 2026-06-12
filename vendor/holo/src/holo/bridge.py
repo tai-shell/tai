@@ -215,6 +215,8 @@ class BridgeClient:
         envelope = {"id": rid, "method": method, "params": params or {}}
         line = (json.dumps(envelope) + "\n").encode("utf-8")
 
+        effective_timeout = self.default_timeout if timeout is None else timeout
+
         with self._lock:
             try:
                 self._proc.stdin.write(line)
@@ -222,52 +224,89 @@ class BridgeClient:
             except (BrokenPipeError, OSError) as e:
                 raise BridgeError(-32000, "bridge stdin closed: " + str(e)) from e
 
+            # Watchdog: a wedged JVM call (e.g. a cross-app activation that
+            # blocks inside SikuliX) would otherwise hang the blocking
+            # readline() below forever. Kill the subprocess after
+            # `effective_timeout` seconds so the readline returns EOF and we
+            # fail fast; the dead handle is dropped and the bridge is
+            # re-spawned lazily on the next request.
+            timed_out = {"hit": False}
+
+            def _watchdog() -> None:
+                timed_out["hit"] = True
+                proc = self._proc
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+
+            watchdog: threading.Timer | None = None
+            if effective_timeout and effective_timeout > 0:
+                watchdog = threading.Timer(effective_timeout, _watchdog)
+                watchdog.daemon = True
+                watchdog.start()
+
             # Skip stdout chatter from SikuliX/JVM that bypassed the
             # bridge's silencer (action logs, JVM warnings, etc.). Look
             # for the first line that parses as a JSON object — that's
             # our response. Bound the skip so a dead bridge fails fast.
             response: dict[str, Any] | None = None
             skipped: list[str] = []
-            for _ in range(32):
-                raw = self._proc.stdout.readline()
-                if not raw:
-                    # Popen with `bufsize=0` gives raw FileIO streams, which
-                    # implement `read()` but not `read1()`. Use plain `read`
-                    # so the diagnostic itself doesn't crash with
-                    # AttributeError and bury the real cause of the
-                    # stdout-closed condition.
-                    stderr_tail = b""
-                    if self._proc.stderr is not None:
-                        try:
-                            stderr_tail = self._proc.stderr.read(4096) or b""
-                        except (ValueError, OSError):
-                            pass
+            try:
+                for _ in range(32):
+                    raw = self._proc.stdout.readline()
+                    if not raw:
+                        if timed_out["hit"]:
+                            raise BridgeError(
+                                -32004,
+                                "bridge call '" + method + "' timed out after "
+                                + str(effective_timeout) + "s",
+                            )
+                        # Popen with `bufsize=0` gives raw FileIO streams,
+                        # which implement `read()` but not `read1()`. Use
+                        # plain `read` so the diagnostic itself doesn't crash
+                        # with AttributeError and bury the real cause of the
+                        # stdout-closed condition.
+                        stderr_tail = b""
+                        if self._proc.stderr is not None:
+                            try:
+                                stderr_tail = self._proc.stderr.read(4096) or b""
+                            except (ValueError, OSError):
+                                pass
+                        raise BridgeError(
+                            -32001,
+                            "bridge stdout closed; stderr tail: "
+                            + stderr_tail.decode("utf-8", errors="replace"),
+                        )
+                    try:
+                        decoded = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        skipped.append(repr(raw))
+                        continue
+                    stripped = decoded.lstrip()
+                    if not stripped.startswith("{"):
+                        skipped.append(decoded.rstrip("\n"))
+                        continue
+                    try:
+                        response = json.loads(decoded)
+                    except json.JSONDecodeError:
+                        skipped.append(decoded.rstrip("\n"))
+                        continue
+                    break
+                if response is None:
                     raise BridgeError(
-                        -32001,
-                        "bridge stdout closed; stderr tail: "
-                        + stderr_tail.decode("utf-8", errors="replace"),
+                        -32002,
+                        "no JSON response after 32 lines; skipped: "
+                        + " | ".join(skipped[-5:]),
                     )
-                try:
-                    decoded = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    skipped.append(repr(raw))
-                    continue
-                stripped = decoded.lstrip()
-                if not stripped.startswith("{"):
-                    skipped.append(decoded.rstrip("\n"))
-                    continue
-                try:
-                    response = json.loads(decoded)
-                except json.JSONDecodeError:
-                    skipped.append(decoded.rstrip("\n"))
-                    continue
-                break
-            if response is None:
-                raise BridgeError(
-                    -32002,
-                    "no JSON response after 32 lines; skipped: "
-                    + " | ".join(skipped[-5:]),
-                )
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+                # If the watchdog fired, the JVM was killed — drop the dead
+                # handle so the next request re-spawns a fresh bridge.
+                if timed_out["hit"]:
+                    self._proc = None
 
         if response.get("id") != rid:
             raise BridgeError(

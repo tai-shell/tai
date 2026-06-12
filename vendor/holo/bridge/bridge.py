@@ -79,8 +79,33 @@ def handle_ping(_params):
 
 def handle_app_activate(params):
     name = params["name"]
-    app = App(name)
-    app.focus()
+    # SikuliX 2.0.5's App(name).focus() does its own cross-app activation,
+    # which on recent macOS (Sonoma+ / Tahoe) silently surfaces the wrong
+    # app (the last-active GUI app, e.g. Chrome) and can block forever inside
+    # the JVM. Activate via osascript instead — the same belt-and-suspenders
+    # convention the rest of holo follows for cross-app activation.
+    from java.lang import ProcessBuilder
+    from java.io import BufferedReader, InputStreamReader
+    # Escape for the AppleScript double-quoted string literal.
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    script = 'tell application "' + escaped + '" to activate'
+    pb = ProcessBuilder(["osascript", "-e", script])
+    pb.redirectErrorStream(True)
+    proc = pb.start()
+    # Drain stdout (errors are merged in) so the child can't wedge on a full
+    # pipe buffer, then wait for it to exit.
+    reader = BufferedReader(InputStreamReader(proc.getInputStream()))
+    out_lines = []
+    chunk = reader.readLine()
+    while chunk is not None:
+        out_lines.append(chunk)
+        chunk = reader.readLine()
+    rc = proc.waitFor()
+    if rc != 0:
+        raise RuntimeError(
+            "osascript activate failed (rc=" + str(rc) + "): "
+            + "\n".join(out_lines)
+        )
     return {"focused": True, "name": name}
 
 
