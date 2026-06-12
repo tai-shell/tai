@@ -72,6 +72,13 @@ def _run_applescript(script: str, *, timeout: float = OSASCRIPT_TIMEOUT_S) -> st
             ["osascript", "-e", script],
             capture_output=True,
             text=True,
+            # osascript emits UTF-8. Pin it explicitly: under SSH/launchd the
+            # bridge often runs with no LANG/LC_* set, so the locale default
+            # is ASCII and any non-ASCII title char (·, –, ', emoji, accents)
+            # would raise UnicodeDecodeError instead of returning. errors=
+            # "replace" keeps a title read from ever hard-failing on decode.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
