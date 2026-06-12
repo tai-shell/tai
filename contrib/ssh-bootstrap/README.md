@@ -6,12 +6,19 @@ permanently installing anything on B. The binary lives in `/tmp`,
 the listener is launched inside Terminal.app on B (TCC-aware), and
 Claude on A talks to it over an SSH-tunneled TCP transport.
 
+**The user wires `mcp-bridge.py` into Claude's MCP config and that's
+it** — every Claude session triggers `mcp-bridge.py`, which itself
+ships the binary (only when its sha differs from the remote copy),
+generates a fresh per-session token + launcher, fires it inside
+Terminal.app, waits for the listener, and bridges Claude's stdio.
+No external `bootstrap.sh` invocation needed.
+
 | File | Where it runs | What it does |
 |---|---|---|
-| `bootstrap.sh` | Host A | One-shot: scp the tai binary + a generated `launcher.command` to `/tmp` on Host B, then `ssh open` the launcher so it runs inside Terminal.app. |
-| Generated `launcher.command` | Host B (inside Terminal.app) | Symlinks `/tmp/tai` → `/tmp/tcsh`, writes the per-session token to `/tmp/tai-token`, spawns `tcsh --listen` detached, auto-closes the Terminal window. |
-| `mcp-bridge.py` | Host A | The MCP server command Claude spawns. Opens an SSH `-L` tunnel to Host B, sends the handshake, relays Claude's stdio to/from the tunneled socket. |
-| `smoke.sh` | Host A | Manual end-to-end verification (initialize, tools/list, doctor, screen_move). Run after `bootstrap.sh` to confirm the round-trip works before plugging into Claude. |
+| `mcp-bridge.py` | Host A (spawned by Claude) | One-stop: scp binary if sha mismatches, generate + scp launcher.command, `ssh open` it inside Terminal.app, wait for tcsh, open SSH tunnel, handshake, relay stdio. |
+| Generated `launcher.command` | Host B (inside Terminal.app) | Symlinks `/tmp/tai` → `/tmp/tcsh`, writes the per-session token to `/tmp/tai-token`, spawns `tcsh --listen` detached, auto-closes the Terminal window. Generated fresh by `mcp-bridge.py` per session. |
+| `bootstrap.sh` | Host A (optional / debug) | Same setup steps as `mcp-bridge.py` does internally, but as a separate script. Useful for pre-warming a Mac, debugging the chain step by step, or running smoke.sh without Claude. Not required for normal use. |
+| `smoke.sh` | Host A | End-to-end verification (initialize, tools/list, doctor, screen_move). Drives `mcp-bridge.py` with canned JSON-RPC; pass/fail in 30 s. |
 
 ## Why this layout
 
@@ -78,28 +85,44 @@ kills any prior tcsh listener before starting a new one.
 cd contrib/ssh-bootstrap
 chmod +x bootstrap.sh mcp-bridge.py smoke.sh
 
-# 1. Bootstrap (ships binary + launcher, opens it inside Terminal.app)
-TAI_BINARY=~/Downloads/tai-bundled-macos-universal2 \
-    ./bootstrap.sh user@hostB
-
-# A Terminal window briefly flashes on B's screen and auto-closes;
-# the detached listener now lives at 127.0.0.1:7081 on B.
-
-# 2. Verify
-./smoke.sh user@hostB
-# Expected: ✓ PASS, 26 tools, screen_move 500 500 succeeds — the
-# cursor on B should also briefly jump to (500, 500).
-
-# 3. Wire into Claude. Add to ~/.claude.json (or per-project):
+# Wire into Claude. Add to ~/.claude.json (or per-project):
 #    {
 #      "mcpServers": {
 #        "tai-on-hostB": {
-#          "command": "/full/path/to/mcp-bridge.py",
-#          "args": ["user@hostB", "7081"]
+#          "command": "/full/path/to/contrib/ssh-bootstrap/mcp-bridge.py",
+#          "args": ["user@hostB", "7081"],
+#          "env": {
+#            "TAI_BINARY": "/Users/me/Downloads/tai-bundled-macos-universal2"
+#          }
 #        }
 #      }
 #    }
 ```
+
+That's it. The first Claude session ships the binary (~3-30 s
+depending on link speed), fires the listener, and starts serving
+MCP. Subsequent sessions skip the binary scp (sha match) and start
+in ~2-5 s.
+
+Optional smoke test (before plugging into Claude):
+
+```sh
+TAI_BINARY=~/Downloads/tai-bundled-macos-universal2 \
+    ./smoke.sh user@hostB
+
+# Expected: ✓ PASS, 26 tools, screen_move 500 500 succeeds — the
+# cursor on B should also briefly jump to (500, 500).
+```
+
+Optional manual bootstrap (debugging / pre-warming):
+
+```sh
+TAI_BINARY=~/Downloads/tai-bundled-macos-universal2 \
+    ./bootstrap.sh user@hostB
+```
+
+Runs the same setup steps that `mcp-bridge.py` does internally —
+useful when you want to verify each step manually.
 
 Claude can now call `screen_move`, `screen_click`, `screen_type`,
 `browser_*`, `ui_template_*`, etc. on the remote Mac.
