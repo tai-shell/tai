@@ -5408,6 +5408,7 @@ parse_dispatch_payload (int return_token)
 	    if (tail_ch != EOF) shell_ungetc (tail_ch);
 	    {
 	      size_t i;
+	      int found_else = 0;
 	      for (i = 0; i + 4 < tail_indx; i++)
 		{
 		  if ((i == 0 || tail_buf[i - 1] == ' ' || tail_buf[i - 1] == '\t') &&
@@ -5423,8 +5424,24 @@ parse_dispatch_payload (int return_token)
 		      if (action_at < tail_indx)
 			shell_ungets (tail_buf + action_at);
 		      token_to_read = ELSE;
+		      found_else = 1;
 		      break;
 		    }
+		}
+	      /* No `else' in tail_buf -- the captured chars belong to
+		 the NEXT statement (`end' on its own line means the
+		 block-end loop already consumed past `end' to find the
+		 trailing tail). Push them back AND then push a newline
+		 in front so yacc sees a statement-terminator between
+		 AT/ON_DISPATCH and the next statement. Order: ungets
+		 first (puts tail_buf at front), then ungetc(\n) (puts
+		 \n at the very front). Without the newline, yacc reports
+		 `syntax error near unexpected token'. Affects both `@'
+		 and `on' block forms. */
+	      if (!found_else && tail_indx > 0)
+		{
+		  shell_ungets (tail_buf);
+		  shell_ungetc ('\n');
 		}
 	    }
 	    free (tail_buf);

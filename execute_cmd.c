@@ -4000,41 +4000,98 @@ execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
   return exec_result;
 }
 
+/* Per-host else helper (Phase 3.D.4): iterate $ON_HOSTS (just bound
+   by the bridge) and run else_action once per failed host with
+   $HOLO_HOST rebound. Returns max(else exits); if $ON_HOSTS is
+   missing or has no failed entries, runs else_action once as the
+   conventional fallback. */
+static int
+run_per_host_else (COMMAND *else_action)
+{
+  SHELL_VAR *hosts_var = find_variable ("ON_HOSTS");
+  if (hosts_var == NULL || array_p (hosts_var) == 0)
+    return execute_command (else_action);
+
+  ARRAY *a = array_cell (hosts_var);
+  ARRAY_ELEMENT *ae;
+  int else_max = EXECUTION_SUCCESS;
+  int saw_failed = 0;
+  for (ae = element_forw (a->head); ae != a->head; ae = element_forw (ae))
+    {
+      const char *entry = element_value (ae);
+      if (entry == NULL)
+	continue;
+      const char *colon = strrchr (entry, ':');
+      if (colon == NULL || colon == entry)
+	continue;
+      if (atoi (colon + 1) == 0)
+	continue;	/* host succeeded -- skip */
+      saw_failed = 1;
+      size_t host_len = (size_t)(colon - entry);
+      char *host = (char *)xmalloc (host_len + 1);
+      memcpy (host, entry, host_len);
+      host[host_len] = '\0';
+      bind_variable ("HOLO_HOST", host, 0);
+      free (host);
+      int r = execute_command (else_action);
+      if (r > else_max)
+	else_max = r;
+    }
+  unbind_variable ("HOLO_HOST");
+  if (!saw_failed)
+    return execute_command (else_action);
+  return else_max;
+}
+
 /* tai holo "on" dispatch -- routes the parsed AST node through the
    C->Python bridge in holo_on_dispatch.c, which calls
    tai_runtime.holo_on.dispatch.dispatch_from_c. Output streams are
    written to the tai process stdout/stderr by the Python runtime.
-   else_action runs only when the dispatch returns non-zero. */
+   else_action runs once per failed host (3.D.4); $ON_HOSTS is bound
+   to a (host:exit) array (3.D.3). do..end blocks (3.D.5) iterate
+   each line against the discovered host set; $ON_HOSTS reflects the
+   LAST line, exit code is max() across all lines. */
 static int
 execute_on_dispatch_command (ON_DISPATCH_COM *on_command)
 {
   const char *sel_raw = (on_command->selector && on_command->selector->word)
     ? on_command->selector->word : "";
-  const char *body_raw = (on_command->prompt && on_command->prompt->word)
-    ? on_command->prompt->word : "";
-  const char *sentinel = (on_command->sentinel && on_command->sentinel->word)
-    ? on_command->sentinel->word : (const char *)NULL;
 
-  /* Phase 3.B.3: do..end block form is parsed but not yet routed --
-     the design doc covers it under Phase 3.D alongside modes. For
-     now, an `on .. do .. end' compiles and the block AST is built,
-     but execution dispatches only the single-line form. */
+  int exec_result;
   if (on_command->block)
     {
-      fprintf (stderr,
-	       "tai: `on .. do .. end' block form not yet supported "
-	       "(Phase 3.D); selector=%s\n", sel_raw);
-      if (on_command->else_action)
-	return execute_command (on_command->else_action);
-      return EXECUTION_FAILURE;
+      /* do..end: dispatch each block line against the discovered
+	 target set. v1 calls the bridge once per line, which re-runs
+	 discovery each time -- correct but O(N*settle); 3.E can add
+	 a multi-line Python entry that browses once. The sentinel on
+	 each line is captured but unused (matches the @-side
+	 behaviour today). */
+      exec_result = EXECUTION_SUCCESS;
+      AGENT_BLOCK_LINE *bl;
+      for (bl = on_command->block; bl; bl = bl->next)
+	{
+	  const char *line_raw = (bl->prompt && bl->prompt->word)
+	    ? bl->prompt->word : "";
+	  const char *line_sentinel = (bl->sentinel && bl->sentinel->word)
+	    ? bl->sentinel->word : (const char *)NULL;
+	  int r = holo_on_dispatch_call (sel_raw, line_raw, line_sentinel);
+	  if (r > exec_result)
+	    exec_result = r;
+	}
+    }
+  else
+    {
+      const char *body_raw = (on_command->prompt && on_command->prompt->word)
+	? on_command->prompt->word : "";
+      const char *sentinel = (on_command->sentinel && on_command->sentinel->word)
+	? on_command->sentinel->word : (const char *)NULL;
+      exec_result = holo_on_dispatch_call (sel_raw, body_raw, sentinel);
     }
 
-  int exec_result = holo_on_dispatch_call (sel_raw, body_raw, sentinel);
+  if (exec_result == EXECUTION_SUCCESS || on_command->else_action == NULL)
+    return exec_result;
 
-  if (exec_result != EXECUTION_SUCCESS && on_command->else_action)
-    return execute_command (on_command->else_action);
-
-  return exec_result;
+  return run_per_host_else (on_command->else_action);
 }
 #endif
 
