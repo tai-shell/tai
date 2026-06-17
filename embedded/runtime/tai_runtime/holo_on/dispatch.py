@@ -25,6 +25,7 @@ real transport.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from typing import Any, TextIO
@@ -50,8 +51,19 @@ def dispatch(
     holo_extra_args: list[str] | None = None,
     stdout: TextIO,
     stderr: TextIO,
-) -> int:
-    """End-to-end dispatch. Returns the process exit code.
+) -> dict[str, Any]:
+    """End-to-end dispatch. Returns a result dict.
+
+    Return shape::
+
+        {"exit": int, "hosts": [{"host": str, "resource": str, "exit": int}, ...]}
+
+    ``exit`` is ``max(per-host exit_code)`` (or 2 on selector parse
+    error / single-target ambiguity, 0 on broadcast-with-no-matches).
+    ``hosts`` is the per-target outcome list, in target order — the
+    C bridge binds this as the ``$ON_HOSTS`` bash array after the
+    dispatch returns. Callers that only care about the exit can do
+    ``result["exit"]``.
 
     Top-level flow:
 
@@ -65,16 +77,11 @@ def dispatch(
          we got the wrong number).
       5. For each match: connect to its MCP endpoint, list its
          resources, filter by the selector's resource-name predicate,
-         dispatch the body per (host, resource).
-      6. Combine per-host exit codes via max().
-
-    Output:
-      - Each frame's ``data`` is written to ``stdout`` as a line for
-        stdout frames; to ``stderr`` for stderr frames (always with a
-        ``host:`` prefix on stderr per Q4).
-      - Order across hosts is determined by per-target completion
-        order — Phase 3.A waits for each target sequentially. 3.B+
-        will fan out concurrently.
+         dispatch the body per (host, resource), concurrently via
+         ``asyncio.gather`` (Phase 3.D.2).
+      6. Combine per-host exit codes via max() for the top-level
+         exit, but the full per-host outcome list is returned so
+         the C side can populate ``$ON_HOSTS``.
     """
     extra = list(holo_extra_args or [])
     # holo's CLI requires --announce to be present whenever --resources-
@@ -94,7 +101,7 @@ def dispatch(
         selector = parse_selector(selector_str)
     except SelectorError as e:
         print(f"holo-on: {e}", file=stderr)
-        return 2
+        return {"exit": 2, "hosts": []}
 
     # Run discovery OUTSIDE asyncio.run — python-zeroconf's sync API
     # and asyncio don't compose well in our setup (callbacks delivered
@@ -126,19 +133,19 @@ async def _dispatch_async(
     extra_args: list[str],
     stdout: TextIO,
     stderr: TextIO,
-) -> int:
+) -> dict[str, Any]:
     if not sessions:
         if selector.broadcast:
             print(
                 "holo-on: no daemons matched selector — nothing to do",
                 file=stderr,
             )
-            return 0
+            return {"exit": 0, "hosts": []}
         print(
             "holo-on: single-target selector matched zero daemons",
             file=stderr,
         )
-        return 2
+        return {"exit": 2, "hosts": []}
     if not selector.broadcast and len(sessions) > 1:
         print(
             f"holo-on: single-target selector matched "
@@ -146,7 +153,7 @@ async def _dispatch_async(
             f"narrow the predicates",
             file=stderr,
         )
-        return 2
+        return {"exit": 2, "hosts": []}
 
     targets = []
     for session in sessions:
@@ -175,14 +182,29 @@ async def _dispatch_async(
             "holo-on: no resources matched on any discovered daemon",
             file=stderr,
         )
-        return 2 if not selector.broadcast else 0
+        return {"exit": 2 if not selector.broadcast else 0, "hosts": []}
 
     timeout_s = (
         int(selector.timeout_s) if selector.timeout_s is not None else 60
     )
-    exits: list[int] = []
-    for session, resource in targets:
+
+    # Concurrent fan-out. Each target spawns its own `holo mcp`
+    # subprocess and runs its MCP round-trip on the event loop;
+    # asyncio.gather waits for all of them. Output framing is
+    # emitted per-target as each finishes (in completion order, not
+    # target order) — for default mode each frame's `print()` is
+    # line-atomic under the GIL, so concurrent emits never split a
+    # line mid-string. For ``:tagged`` / ``:json`` the host prefix
+    # makes interleave order irrelevant.
+    async def _run_one(
+        session: dict[str, Any], resource: dict[str, Any]
+    ) -> dict[str, Any]:
         host = session.get("host", "?")
+        rec: dict[str, Any] = {
+            "host": host,
+            "resource": resource["name"],
+            "exit": 0,
+        }
         try:
             result = await exec_in_resource(
                 holo_command,
@@ -193,25 +215,38 @@ async def _dispatch_async(
             )
         except HoloMCPClientError as e:
             print(f"holo-on: {host}: exec failed: {e}", file=stderr)
-            exits.append(1)
-            continue
+            rec["exit"] = 1
+            return rec
         if "error" in result:
             print(
                 f"holo-on: {host}:{resource['name']}: "
                 f"{result['error']}: {result.get('message', '')}",
                 file=stderr,
             )
-            exits.append(1)
-            continue
+            rec["exit"] = 1
+            return rec
         _emit_frames(
-            host, resource["name"], result, stdout=stdout, stderr=stderr
+            host,
+            resource["name"],
+            result,
+            stdout=stdout,
+            stderr=stderr,
+            mode=selector.mode,
         )
-        exits.append(int(result.get("exit", 0)))
+        rec["exit"] = int(result.get("exit", 0))
+        return rec
 
-    return max(exits) if exits else 0
+    host_results = await asyncio.gather(
+        *(_run_one(session, resource) for session, resource in targets)
+    )
+    exits = [r["exit"] for r in host_results]
+    return {
+        "exit": max(exits) if exits else 0,
+        "hosts": host_results,
+    }
 
 
-def dispatch_from_c(selector_str: str, body: str) -> int:
+def dispatch_from_c(selector_str: str, body: str) -> dict[str, Any]:
     """Entry point called from C (``holo_on_dispatch.c``).
 
     Wraps :func:`dispatch` for the bash-side ``on`` keyword: the C
@@ -221,8 +256,10 @@ def dispatch_from_c(selector_str: str, body: str) -> int:
     the tai shell's actual stdout/stderr). ``HOLO_CLI`` env var
     overrides the spawned daemon command for testing.
 
-    Returns the int exit code the C bridge propagates back to the
-    shell as the command's ``$?``.
+    Returns the same dict :func:`dispatch` returns:
+    ``{"exit": int, "hosts": [{"host", "resource", "exit"}, ...]}``.
+    The C bridge unpacks ``exit`` as the shell command's ``$?`` and
+    binds ``hosts`` as the ``$ON_HOSTS`` bash array (3.D.3).
     """
     holo_cmd = os.environ.get("HOLO_CLI") or "holo"
     extra_env = os.environ.get("HOLO_ON_EXTRA_ARGS")
@@ -244,13 +281,26 @@ def _emit_frames(
     *,
     stdout: TextIO,
     stderr: TextIO,
+    mode: str = "default",
 ) -> None:
     """Write the response's frames to the caller's streams per Q4.
 
-    Phase 3.A only implements the **default mode**: raw line-atomic
-    concat to stdout for stdout frames, ``host:`` prefix on stderr
-    for stderr frames. Modes ``:tagged`` and ``:json`` are deferred
-    to Phase 3.D.
+    Three modes:
+
+      ``default`` — stdout frames written raw (caller self-tags via
+                    ``$HOLO_HOST`` if attribution matters); stderr
+                    frames always prefixed with ``host:resource:``.
+
+      ``tagged``  — every line (stdout AND stderr) prefixed with
+                    ``host:resource:``. The asymmetry of default is
+                    gone; piping through awk needs the column-shift
+                    awareness called out in the design doc.
+
+      ``json``    — every frame emitted as one JSONL object on
+                    stdout: ``{"host","resource","fd","data"}``.
+                    Stderr frames are routed to stdout in this mode
+                    so consumers piping the JSONL get the full
+                    stream in one place; lossless multiplexing.
 
     Each frame is written as a single line + trailing newline so
     callers can pipe through ``awk`` / ``sort`` / etc. without
@@ -259,7 +309,26 @@ def _emit_frames(
     for frame in result.get("frames", ()):
         fd = frame.get("fd")
         data = frame.get("data", "")
-        if fd == "stderr":
-            print(f"{host}:{resource_name}: {data}", file=stderr, flush=True)
-        else:
-            print(data, file=stdout, flush=True)
+        if mode == "json":
+            print(
+                json.dumps(
+                    {
+                        "host": host,
+                        "resource": resource_name,
+                        "fd": fd,
+                        "data": data,
+                    }
+                ),
+                file=stdout,
+                flush=True,
+            )
+        elif mode == "tagged":
+            target = stderr if fd == "stderr" else stdout
+            print(f"{host}:{resource_name}: {data}", file=target, flush=True)
+        else:  # default
+            if fd == "stderr":
+                print(
+                    f"{host}:{resource_name}: {data}", file=stderr, flush=True
+                )
+            else:
+                print(data, file=stdout, flush=True)

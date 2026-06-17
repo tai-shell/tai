@@ -108,8 +108,8 @@ caps = ["exec:find", "exec:wc"]
             stdout=out,
             stderr=err,
         )
-        assert rc == 0, (
-            f"dispatch exit={rc} stderr={err.getvalue()[:300]!r}"
+        assert rc["exit"] == 0, (
+            f"dispatch exit={rc['exit']} stderr={err.getvalue()[:300]!r}"
         )
         # The body produces `       2` on stdout (wc -l of two .mp4 files).
         assert "2" in out.getvalue(), (
@@ -131,7 +131,7 @@ caps = ["exec:find", "exec:wc"]
             stdout=out,
             stderr=err,
         )
-        assert rc != 0
+        assert rc["exit"] != 0
         assert "body-rejected" in err.getvalue()
 
     def test_unknown_tag_zero_matches_exit_0(
@@ -150,7 +150,7 @@ caps = ["exec:find", "exec:wc"]
             stderr=err,
         )
         # Broadcast + no matches → exit 0 (nothing to do is not an error).
-        assert rc == 0
+        assert rc["exit"] == 0
         assert "no daemons matched" in err.getvalue()
 
     def test_bad_selector_exits_2(
@@ -170,7 +170,7 @@ caps = ["exec:find", "exec:wc"]
             stdout=out,
             stderr=err,
         )
-        assert rc == 2
+        assert rc["exit"] == 2
         assert "holo:" in err.getvalue()
 
 
