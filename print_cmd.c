@@ -240,6 +240,10 @@ make_command_string_internal (COMMAND *command)
 	case cm_agent_dispatch:
 	  print_agent_dispatch_command (command->value.AgentDispatch);
 	  break;
+
+	case cm_on_dispatch:
+	  print_on_dispatch_command (command->value.OnDispatch);
+	  break;
 #endif
 
 #if defined (COND_COMMAND)
@@ -914,6 +918,40 @@ print_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
     {
       cprintf (" else ");
       make_command_string_internal (agent_command->else_action);
+    }
+}
+
+void
+print_on_dispatch_command (ON_DISPATCH_COM *on_command)
+{
+  cprintf ("on");
+  if (on_command->selector && on_command->selector->word)
+    cprintf (" %s", on_command->selector->word);
+  if (on_command->block)
+    {
+      AGENT_BLOCK_LINE *bl;
+      cprintf (" do");
+      for (bl = on_command->block; bl; bl = bl->next)
+	{
+	  cprintf ("\n  ");
+	  if (bl->prompt && bl->prompt->word)
+	    cprintf ("%s", bl->prompt->word);
+	  if (bl->sentinel && bl->sentinel->word)
+	    cprintf (" /%s", bl->sentinel->word);
+	}
+      cprintf ("\nend");
+    }
+  else
+    {
+      if (on_command->prompt && on_command->prompt->word)
+	cprintf (" %s", on_command->prompt->word);
+      if (on_command->sentinel && on_command->sentinel->word)
+	cprintf (" /%s", on_command->sentinel->word);
+    }
+  if (on_command->else_action)
+    {
+      cprintf (" else ");
+      make_command_string_internal (on_command->else_action);
     }
 }
 #endif

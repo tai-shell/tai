@@ -25,6 +25,8 @@ real transport.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from typing import Any, TextIO
 
 from tai_runtime.holo_on.discovery import find_matches
@@ -207,6 +209,32 @@ async def _dispatch_async(
         exits.append(int(result.get("exit", 0)))
 
     return max(exits) if exits else 0
+
+
+def dispatch_from_c(selector_str: str, body: str) -> int:
+    """Entry point called from C (``holo_on_dispatch.c``).
+
+    Wraps :func:`dispatch` for the bash-side ``on`` keyword: the C
+    bridge has the parsed selector + body strings but no convenient
+    way to pass file objects, so we default to ``sys.stdout`` /
+    ``sys.stderr`` (which the embedded CPython sets up to point at
+    the tai shell's actual stdout/stderr). ``HOLO_CLI`` env var
+    overrides the spawned daemon command for testing.
+
+    Returns the int exit code the C bridge propagates back to the
+    shell as the command's ``$?``.
+    """
+    holo_cmd = os.environ.get("HOLO_CLI") or "holo"
+    extra_env = os.environ.get("HOLO_ON_EXTRA_ARGS")
+    extra = extra_env.split(None) if extra_env else None
+    return dispatch(
+        selector_str=selector_str,
+        body=body,
+        holo_command=holo_cmd,
+        holo_extra_args=extra,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
 
 
 def _emit_frames(

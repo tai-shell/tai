@@ -93,3 +93,6 @@ configure.lineno
 # Harmless to ship but pure churn in `git status`.
 __pycache__/
 *.pyc
+
+# Claude Code local (personal) settings
+.claude/settings.local.json

@@ -49,6 +49,7 @@ static ARITH_COM *copy_arith_command (ARITH_COM *);
 #endif
 #if defined (AGENT_DISPATCH)
 static AGENT_DISPATCH_COM *copy_agent_dispatch_command (AGENT_DISPATCH_COM *);
+static ON_DISPATCH_COM *copy_on_dispatch_command (ON_DISPATCH_COM *);
 #endif
 #if defined (COND_COMMAND)
 static COND_COM *copy_cond_command (COND_COM *);
@@ -317,6 +318,36 @@ copy_agent_dispatch_command (AGENT_DISPATCH_COM *com)
 
   return (new_com);
 }
+
+static ON_DISPATCH_COM *
+copy_on_dispatch_command (ON_DISPATCH_COM *com)
+{
+  ON_DISPATCH_COM *new_com;
+
+  new_com = (ON_DISPATCH_COM *)xmalloc (sizeof (ON_DISPATCH_COM));
+  new_com->flags = com->flags;
+  new_com->line = com->line;
+  new_com->selector = com->selector ? copy_word (com->selector) : (WORD_DESC *)NULL;
+  new_com->prompt = com->prompt ? copy_word (com->prompt) : (WORD_DESC *)NULL;
+  new_com->sentinel = com->sentinel ? copy_word (com->sentinel) : (WORD_DESC *)NULL;
+  new_com->else_action = com->else_action ? copy_command (com->else_action) : (COMMAND *)NULL;
+  new_com->block = (AGENT_BLOCK_LINE *)NULL;
+  {
+    AGENT_BLOCK_LINE *src, *prev = (AGENT_BLOCK_LINE *)NULL;
+    for (src = com->block; src; src = src->next)
+      {
+	AGENT_BLOCK_LINE *cp = (AGENT_BLOCK_LINE *)xmalloc (sizeof (AGENT_BLOCK_LINE));
+	cp->prompt = src->prompt ? copy_word (src->prompt) : (WORD_DESC *)NULL;
+	cp->sentinel = src->sentinel ? copy_word (src->sentinel) : (WORD_DESC *)NULL;
+	cp->next = (AGENT_BLOCK_LINE *)NULL;
+	if (prev) prev->next = cp;
+	else new_com->block = cp;
+	prev = cp;
+      }
+  }
+
+  return (new_com);
+}
 #endif
 
 #if defined (COND_COMMAND)
@@ -443,6 +474,10 @@ copy_command (COMMAND *command)
 #if defined (AGENT_DISPATCH)
       case cm_agent_dispatch:
 	new_command->value.AgentDispatch = copy_agent_dispatch_command (command->value.AgentDispatch);
+	break;
+
+      case cm_on_dispatch:
+	new_command->value.OnDispatch = copy_on_dispatch_command (command->value.OnDispatch);
 	break;
 #endif
 

@@ -41,8 +41,10 @@ import logging
 import secrets
 import threading
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from holo.announce import Resource
 from holo.capabilities import CapabilitiesProbe
 
 if TYPE_CHECKING:
@@ -72,6 +74,7 @@ class CapabilitiesServer:
         token: str | None = None,
         host: str = DEFAULT_BIND_HOST,
         port: int = 0,
+        resources: Sequence[Resource] | None = None,
     ) -> None:
         self.probe = probe
         # `secrets.token_urlsafe(32)` yields ~43 chars of base64url —
@@ -80,6 +83,10 @@ class CapabilitiesServer:
         self.token = token if token is not None else secrets.token_urlsafe(32)
         self.host = host
         self.port = port
+        # Per-host resource records. Served by /v1/resources behind the
+        # same token-auth as /capabilities. Empty / None → endpoint
+        # returns {"resources": []}; callers distinguish by tag membership.
+        self.resources: tuple[Resource, ...] = tuple(resources or ())
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self._actual_port: int = 0
@@ -221,10 +228,36 @@ class CapabilitiesServer:
                 )
             return JSONResponse(self.probe.collect())
 
+        async def resources_v1(request: Any) -> Any:
+            # Same auth as /capabilities — path and caps are sensitive
+            # (filesystem layout, exec surface). See docs/resources.md §Q5.
+            received = request.headers.get(CAPS_TOKEN_HEADER.lower(), "")
+            if not secrets.compare_digest(received, self.token):
+                return JSONResponse(
+                    {"error": "unauthorized"},
+                    status_code=401,
+                )
+            return JSONResponse({
+                "resources": [
+                    {
+                        "name": r.name,
+                        "path": r.path,
+                        "tags": list(r.tags),
+                        "caps": list(r.caps),
+                        # Surfaced for tools that want to render the
+                        # intended ACL. NOT enforced in v1 — see
+                        # Resource docstring.
+                        "allow_principals": list(r.allow_principals),
+                    }
+                    for r in self.resources
+                ],
+            })
+
         return Starlette(
             debug=False,
             routes=[
                 Route("/capabilities", capabilities, methods=["GET"]),
+                Route("/v1/resources", resources_v1, methods=["GET"]),
                 Route("/healthz", healthz, methods=["GET"]),
             ],
             # NOTE: no CORSMiddleware on purpose — see module docstring.

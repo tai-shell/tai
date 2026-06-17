@@ -435,6 +435,36 @@ make_agent_dispatch_command (WORD_DESC *selector, WORD_DESC *prompt,
 
   return (command);
 }
+
+/* Build the `on' dispatch command. Mirror of make_agent_dispatch_command;
+   the AST node shape is identical (selector / prompt / sentinel /
+   block / else) but command->type is cm_on_dispatch so the executor
+   routes to the holo / Python bridge instead of the `@' transport. */
+COMMAND *
+make_on_dispatch_command (WORD_DESC *selector, WORD_DESC *prompt,
+			  WORD_DESC *sentinel, AGENT_BLOCK_LINE *block,
+			  COMMAND *else_action, int lineno)
+{
+  COMMAND *command;
+  ON_DISPATCH_COM *temp;
+
+  command = (COMMAND *)xmalloc (sizeof (COMMAND));
+  command->value.OnDispatch = temp = (ON_DISPATCH_COM *)xmalloc (sizeof (ON_DISPATCH_COM));
+
+  temp->flags = 0;
+  temp->line = lineno;
+  temp->selector = selector;
+  temp->prompt = prompt;
+  temp->sentinel = sentinel;
+  temp->block = block;
+  temp->else_action = else_action;
+
+  command->type = cm_on_dispatch;
+  command->redirects = (REDIRECT *)NULL;
+  command->flags = 0;
+
+  return (command);
+}
 #endif
 
 #if defined (COND_COMMAND)

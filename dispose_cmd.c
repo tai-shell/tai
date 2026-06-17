@@ -205,6 +205,34 @@ dispose_command (COMMAND *command)
 	free (c);
 	break;
       }
+
+    case cm_on_dispatch:
+      {
+	register ON_DISPATCH_COM *c;
+
+	c = command->value.OnDispatch;
+	if (c->selector)
+	  dispose_word (c->selector);
+	if (c->prompt)
+	  dispose_word (c->prompt);
+	if (c->sentinel)
+	  dispose_word (c->sentinel);
+	{
+	  AGENT_BLOCK_LINE *bl = c->block;
+	  while (bl)
+	    {
+	      AGENT_BLOCK_LINE *n = bl->next;
+	      if (bl->prompt) dispose_word (bl->prompt);
+	      if (bl->sentinel) dispose_word (bl->sentinel);
+	      free (bl);
+	      bl = n;
+	    }
+	}
+	if (c->else_action)
+	  dispose_command (c->else_action);
+	free (c);
+	break;
+      }
 #endif /* AGENT_DISPATCH */
 
 #if defined (COND_COMMAND)

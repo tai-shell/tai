@@ -206,6 +206,13 @@ static int parse_arith_cmd (char **, int);
 #endif
 #if defined (AGENT_DISPATCH)
 static int parse_at_dispatch (int);
+static int parse_on_dispatch (void);
+/* Shared parser body for both `@' and `on'. Captures selector +
+   prompt + sentinel + else + do/end block and packages them into
+   yylval.agent_dispatch_tok. Returns whichever YACC token the
+   caller specified (AT_DISPATCH for `@', ON_DISPATCH for `on') so
+   the grammar can route to the right command-builder. */
+static int parse_dispatch_payload (int return_token);
 #endif
 #if defined (COND_COMMAND)
 static void cond_error (void);
@@ -414,7 +421,13 @@ static FILE *yyerrstream;
 
 /* More general tokens. yylex () knows how to make these. */
 %token <word> WORD ASSIGNMENT_WORD REDIR_WORD
-%token <agent_dispatch_tok> AT_DISPATCH
+%token <agent_dispatch_tok> AT_DISPATCH ON_DISPATCH
+/* ON_INTRO is the placeholder token value `on' resolves to in the
+   word_token_alist. The CHECK_FOR_RESERVED_WORD macro intercepts
+   it and hands off to parse_on_dispatch (), which captures the
+   selector/body/sentinel/else and returns ON_DISPATCH with the
+   payload attached. ON_INTRO itself never reaches the grammar. */
+%token ON_INTRO
 %token <number> NUMBER
 %token <word_list> ARITH_CMD ARITH_FOR_EXPRS
 %token <command> COND_CMD
@@ -437,7 +450,7 @@ static FILE *yyerrstream;
 %type <command> arith_command
 %type <command> cond_command
 %type <command> arith_for_command
-%type <command> agent_dispatch_command
+%type <command> agent_dispatch_command on_dispatch_command
 %type <command> coproc
 %type <command> comsub funsub
 %type <command> function_def function_body if_command elif_clause subshell
@@ -914,6 +927,8 @@ shell_command:	for_command
 			{ $$ = $1; }
 	|	agent_dispatch_command
 			{ $$ = $1; }
+	|	on_dispatch_command
+			{ $$ = $1; }
 	;
 
 for_command:	FOR WORD newline_list DO compound_list DONE
@@ -1254,6 +1269,27 @@ agent_dispatch_command: AT_DISPATCH
 							    $1->sentinel,
 							    $1->block,
 							    $3, line_number);
+			  free ($1);
+			}
+	;
+
+on_dispatch_command: ON_DISPATCH
+			{
+			  $$ = make_on_dispatch_command ($1->selector,
+							 $1->prompt,
+							 $1->sentinel,
+							 $1->block,
+							 (COMMAND *)NULL,
+							 line_number);
+			  free ($1);
+			}
+	|	ON_DISPATCH ELSE command
+			{
+			  $$ = make_on_dispatch_command ($1->selector,
+							 $1->prompt,
+							 $1->sentinel,
+							 $1->block,
+							 $3, line_number);
 			  free ($1);
 			}
 	;
@@ -2430,6 +2466,14 @@ STRING_INT_ALIST word_token_alist[] = {
 #if defined (COPROCESS_SUPPORT)
   { "coproc", COPROC },
 #endif
+#if defined (AGENT_DISPATCH)
+  /* `on' at command-leading position is the holo dispatch keyword.
+     ON_INTRO is a sentinel token value the CHECK_FOR_RESERVED_WORD
+     macro intercepts; the real token (ON_DISPATCH, carrying the
+     parsed selector/body/sentinel/block payload) is returned by
+     parse_on_dispatch (). ON_INTRO never reaches the grammar. */
+  { "on", ON_INTRO },
+#endif
   { (char *)NULL, 0}
 };
 
@@ -3229,6 +3273,17 @@ static int open_brace_count;
 		break; /* Posix grammar rule 4 */ \
 	      if ((parser_state & PST_CASEPAT) && last_read_token == '(' && word_token_alist[i].token == ESAC) /*)*/ \
 		break; /* phantom Posix grammar rule 4 */ \
+	      if (word_token_alist[i].token == ON_INTRO) { \
+		/* tai holo dispatch: intercept the `on' keyword before */ \
+		/* returning the alist token. parse_on_dispatch consumes */ \
+		/* the rest of the line (selector / body / sentinel) and */ \
+		/* returns ON_DISPATCH with the parsed payload as yylval. */ \
+		/* On -2 fall through to ordinary word lexing — `on' was */ \
+		/* not in dispatch shape, treat as a regular word. */ \
+		int _on_r = parse_on_dispatch (); \
+		if (_on_r != -2) return _on_r; \
+		break; \
+	      } else \
 	      if (word_token_alist[i].token == ESAC) { \
 		parser_state &= ~(PST_CASEPAT|PST_CASESTMT); \
 		esacs_needed_count--; \
@@ -5066,7 +5121,7 @@ agent_skip_blanks (void)
    Returns -2 to fall back to ordinary word lexing (reserved for
    future cases like `@@' or `@(' if those grow special meaning). */
 static int
-parse_at_dispatch (int c)
+parse_dispatch_payload (int return_token)
 {
   char *sel_buf, *prompt_buf;
   size_t sel_indx, sel_alloc, prompt_indx, prompt_alloc;
@@ -5399,7 +5454,21 @@ parse_at_dispatch (int c)
   tok->sentinel = sentinel_wd;
   tok->block = block_head;
   yylval.agent_dispatch_tok = tok;
-  return AT_DISPATCH;
+  return return_token;
+}
+
+/* Thin wrappers — the parser body is shared by both keywords. */
+static int
+parse_at_dispatch (int c)
+{
+  (void)c;
+  return parse_dispatch_payload (AT_DISPATCH);
+}
+
+static int
+parse_on_dispatch (void)
+{
+  return parse_dispatch_payload (ON_DISPATCH);
 }
 #endif
 

@@ -62,6 +62,7 @@ class HoloMCPServer:
         announce_port: int = 0,
         announce_capabilities: bool = False,
         announce_command: str | None = None,
+        announce_resources: list[Any] | None = None,
         auto_tunnel: bool = False,
         auto_tunnel_backend: str | None = None,
     ) -> None:
@@ -73,6 +74,18 @@ class HoloMCPServer:
         self.remote_screen = remote_screen
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
+
+        # Per-host resources for the Phase 2 exec primitive. Stored as a
+        # name-keyed map so the holo_exec_in_resource MCP tool can look
+        # them up cheaply. Empty when no --announce-resource was passed;
+        # the tool is then NOT registered on the surface (see
+        # build_server).
+        from holo.announce import Resource as _Resource
+
+        self._resources: tuple[_Resource, ...] = tuple(announce_resources or ())
+        self._resource_by_name: dict[str, _Resource] = {
+            r.name: r for r in self._resources
+        }
         # Template cache lives across daemon restarts — it's a pure
         # filesystem store, not bound to any JVM/browser session.
         self.templates = templates if templates is not None else TemplateStore()
@@ -91,7 +104,10 @@ class HoloMCPServer:
                 from holo.capabilities_server import CapabilitiesServer
 
                 probe = CapabilitiesProbe()
-                self._caps_server = CapabilitiesServer(probe=probe)
+                self._caps_server = CapabilitiesServer(
+                    probe=probe,
+                    resources=announce_resources,
+                )
                 self._caps_server.start()
                 caps_port = self._caps_server.actual_port
                 caps_token = self._caps_server.token
@@ -118,6 +134,7 @@ class HoloMCPServer:
                     caps_port=caps_port,
                     caps_token=caps_token,
                     remote_command=announce_command,
+                    resources=announce_resources,
                 )
                 self._announcer.start()
             except Exception as e:  # noqa: BLE001 — surface and continue
@@ -1070,6 +1087,94 @@ class HoloMCPServer:
                 "already_running": False,
             }
 
+    def list_resources(self) -> dict[str, Any]:
+        """Return all resources declared on this daemon.
+
+        Mirrors ``GET /v1/resources`` (capabilities_server) but
+        reached over the MCP channel rather than a separate HTTPS
+        roundtrip. Tai's ``on`` keyword dispatch uses this — the
+        auto-tunnel is already authed and warm; a parallel HTTP call
+        would duplicate trust machinery.
+
+        Returns ``{"resources": [{name, path, tags, caps,
+        allow_principals}, ...]}``. Empty list when no resources are
+        declared (the tool is registered only when at least one is,
+        so this only fires for declared daemons).
+        """
+        return {
+            "resources": [
+                {
+                    "name": r.name,
+                    "path": r.path,
+                    "tags": list(r.tags),
+                    "caps": list(r.caps),
+                    # Surfaced for tools that want to render the
+                    # intended ACL. NOT enforced in v1 — see Resource.
+                    "allow_principals": list(r.allow_principals),
+                }
+                for r in self._resources
+            ],
+        }
+
+    def exec_in_resource(
+        self,
+        resource: str,
+        body: str,
+        env: dict[str, str] | None = None,
+        timeout_s: int = 60,
+    ) -> dict[str, Any]:
+        """Phase 2.A exec primitive — validate, spawn, batch output frames.
+
+        Looks up the resource by name on this daemon's announced
+        resources, runs the body through
+        :func:`holo.resources_exec.exec_in_resource`, and returns a
+        single dict with the collected ``frames`` + terminal status.
+
+        Failure modes (returned as ``{"error": "...", ...}``, never
+        raised — MCP clients see a structured response either way):
+
+          - ``unknown-resource``: ``resource`` doesn't match any announced
+            resource on this daemon. Response includes the known names.
+          - ``body-rejected``: static parse failed (disallowed command,
+            absolute path, traversal). ``message`` names the offender.
+          - ``exec-setup``: a declared cap binary isn't on the daemon's
+            PATH at call time, or the resource path doesn't exist.
+
+        Success returns ``{"frames": [...], "exit": int, "duration_ms":
+        int, "timed_out": bool}`` where ``frames`` is a list of
+        ``{"fd": "stdout"|"stderr", "data": str}`` entries in arrival
+        order across both streams.
+        """
+        from holo.resources_exec import BodyRejected
+        from holo.resources_exec import exec_in_resource as _exec
+
+        r = self._resource_by_name.get(resource)
+        if r is None:
+            return {
+                "error": "unknown-resource",
+                "resource": resource,
+                "known": sorted(self._resource_by_name),
+            }
+        frames: list[dict[str, Any]] = []
+        try:
+            result = _exec(
+                r,
+                body,
+                env=env,
+                timeout_s=timeout_s,
+                on_frame=frames.append,
+            )
+        except BodyRejected as e:
+            return {"error": "body-rejected", "message": str(e)}
+        except FileNotFoundError as e:
+            return {"error": "exec-setup", "message": str(e)}
+        return {
+            "frames": frames,
+            "exit": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "timed_out": result.timed_out,
+        }
+
 
 def _match_session(
     sessions: list[dict[str, Any]], identifier: str
@@ -1122,6 +1227,7 @@ def build_server(
     announce_port: int = 0,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> tuple[FastMCP, HoloMCPServer]:
@@ -1156,6 +1262,7 @@ def build_server(
         announce_port=announce_port,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1608,6 +1715,48 @@ def build_server(
     def holo_launch_ide() -> dict[str, Any]:
         return holo.holo_launch_ide()
 
+    # Phase 2 resource tools. Registered ONLY when at least one
+    # resource is announced — without any resources the tools have
+    # nothing to act on, so leaving them off the surface keeps clients
+    # from discovering entry points that always error.
+    if holo._resources:
+        @mcp.tool(
+            description=(
+                "Return the full per-resource records declared on "
+                "this daemon: name, path, tags, caps, "
+                "allow_principals. Tai's `on` keyword uses this to "
+                "resolve `{holo:tag=X}` selectors over the auto-"
+                "tunnel; mirrors `GET /v1/resources` on the "
+                "capabilities HTTP endpoint. allow_principals is "
+                "informational only in v1 (see docs/resources.md)."
+            )
+        )
+        def holo_list_resources() -> dict[str, Any]:
+            return holo.list_resources()
+
+        @mcp.tool(
+            description=(
+                "Run a shell body inside the scope of a declared "
+                "resource on this daemon. The body must use only "
+                "commands listed in the resource's caps=exec:... "
+                "allowlist, and may not use absolute paths or '..'. "
+                "cwd is pinned to the resource path; HOLO_HOST, "
+                "HOLO_RESOURCE, HOLO_RESOURCE_PATH are injected into "
+                "env. Output is batched into a frames list, each "
+                "frame {fd: 'stdout'|'stderr', data: str}; the "
+                "response includes exit, duration_ms, and timed_out."
+            )
+        )
+        def holo_exec_in_resource(
+            resource: str,
+            body: str,
+            env: dict[str, str] | None = None,
+            timeout_s: int = 60,
+        ) -> dict[str, Any]:
+            return holo.exec_in_resource(
+                resource, body, env=env, timeout_s=timeout_s
+            )
+
     return mcp, holo
 
 
@@ -1659,6 +1808,7 @@ def run(
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> None:
@@ -1677,6 +1827,7 @@ def run(
         announce_ips=announce_ips,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1706,6 +1857,7 @@ def run_tcp(
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
     stop_event: threading.Event | None = None,
@@ -1737,6 +1889,7 @@ def run_tcp(
         announce_port=port,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
