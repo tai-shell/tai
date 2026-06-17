@@ -1,0 +1,39 @@
+#!/usr/local/bin/tai
+# per-host-stats.tai — exercise the full `on` surface:
+#   - do/end block form (multiple commands per dispatch)
+#   - :tagged output mode (every line prefixed `host:resource:`)
+#   - else block firing per failed host with $HOLO_HOST rebound
+#   - $ON_HOSTS array introspection after dispatch
+#
+# Use case: walk each `video-files` host and report two stats —
+# total file count and apparent disk usage of the resource path.
+# If any host fails the dispatch, mention which ones for follow-up.
+
+on [holo:tag=video-files:5m:settle=3000ms:tagged] do
+  find . -type f -name "*.mp4" | wc -l
+  du -sh .
+end else echo "FAILED host: $HOLO_HOST"
+
+# The `do .. end` form runs each line as a separate dispatch
+# against the same matched target set. With `:tagged` mode every
+# emitted line is prefixed `host:resource:` so the two stats from
+# each host are clearly attributable in the interleaved stream.
+#
+# else fires ONCE PER FAILED HOST with $HOLO_HOST rebound — a
+# host where `du` isn't in caps, for example, emits the FAILED
+# line above instead of (or alongside) the stat.
+#
+# After the block, $ON_HOSTS reflects the LAST line's per-host
+# outcomes. For an at-a-glance summary:
+
+echo
+echo "summary:"
+ok=0
+failed=0
+for entry in "${ON_HOSTS[@]}"; do
+  case "$entry" in
+    *:0)   ok=$((ok + 1)) ;;
+    *)     failed=$((failed + 1)) ;;
+  esac
+done
+echo "  $ok OK, $failed failed"
