@@ -26,9 +26,15 @@ Usage:    mcp-bridge.py user@hostB PORT [/path/to/remote-token]
 
 Env:
     TAI_BINARY     local path to tai-bundled-macos-universal2
-                   (default: /usr/local/bin/tai). Must exist + be
-                   executable; sha256 is compared against /tmp/tai
-                   on the remote each session.
+                   (default: /usr/local/bin/tai), OR an http(s) URL
+                   to a release asset. A local path must exist + be
+                   executable. A URL is downloaded once and cached
+                   under ~/Library/Caches/tai/downloads/ keyed by the
+                   asset's sha256 (fetched from a `<url>.sha256`
+                   companion when present), so later sessions reuse the
+                   cached binary with no re-download. Either way the
+                   resolved binary's sha256 is compared against /tmp/tai
+                   on the remote each session and scp'd only on mismatch.
 
 Exit codes:
     0   client (Claude) closed the channel cleanly
@@ -48,6 +54,8 @@ import tempfile
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
 
 DEFAULT_TOKEN_PATH = "/tmp/tai-token"
 DEFAULT_TAI_BINARY = "/usr/local/bin/tai"
@@ -56,14 +64,124 @@ DEFAULT_REMOTE_TCSH_LINK = "/tmp/tcsh"
 DEFAULT_REMOTE_LAUNCHER_PATH = "/tmp/launcher.command"
 DEFAULT_REMOTE_LOG_PATH = "/tmp/tai-listener.log"
 DEFAULT_REMOTE_CACHE_DIR = "~/Library/Caches/tai"
+DOWNLOAD_CACHE_DIR = "~/Library/Caches/tai/downloads"
 
 TUNNEL_READY_TIMEOUT_S = 10.0
 LISTENER_READY_TIMEOUT_S = 10.0
+DOWNLOAD_TIMEOUT_S = 600.0
+SHA256_FETCH_TIMEOUT_S = 30.0
 
 
 def die(msg: str, code: int = 1) -> None:
     sys.stderr.write(f"mcp-bridge: {msg}\n")
     sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — resolve TAI_BINARY: a local path is used as-is; an http(s)
+# URL is downloaded once and cached, keyed by the asset's sha256.
+# ---------------------------------------------------------------------------
+
+
+def _is_url(spec: str) -> bool:
+    return spec.startswith(("http://", "https://"))
+
+
+def _http_get(url: str, *, timeout: float) -> bytes:
+    """GET a URL, following redirects (GitHub release assets 302 to S3).
+    Raises a urllib error on HTTP failure; the caller turns it into a
+    `die`."""
+    req = urllib.request.Request(url, headers={"User-Agent": "tai-mcp-bridge"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _fetch_expected_sha(url: str) -> str | None:
+    """Fetch `<url>.sha256` and return the hex digest, or None if there
+    is no companion (older releases, non-GitHub URLs). The companion is
+    standard `shasum` format: `<hex>  <name>` — we take the first token."""
+    try:
+        body = _http_get(url + ".sha256", timeout=SHA256_FETCH_TIMEOUT_S)
+    except (urllib.error.URLError, OSError):
+        return None
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    digest = text.split()[0].lower()
+    # Sanity-check it looks like a sha256 so a stray HTML 404 body can't
+    # poison the cache key.
+    if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+        return digest
+    return None
+
+
+def _cache_dir() -> str:
+    d = os.path.expanduser(DOWNLOAD_CACHE_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def resolve_binary(spec: str) -> str:
+    """Resolve TAI_BINARY to a local file path.
+
+    Local path → returned unchanged (ensure_binary validates it).
+
+    URL → downloaded once into ~/Library/Caches/tai/downloads/ and
+    reused thereafter. When a `<url>.sha256` companion exists we key
+    the cache file by that digest (`tai-<sha>`) and verify it, so a
+    matching cached file is reused with no download and a corrupt one
+    is re-fetched. Without a companion we key by a hash of the URL and
+    download-once (no integrity check; a warning is logged)."""
+    if not _is_url(spec):
+        return spec
+
+    cache = _cache_dir()
+    expected = _fetch_expected_sha(spec)
+
+    if expected is not None:
+        dest = os.path.join(cache, f"tai-{expected}")
+        if os.path.isfile(dest) and _sha256(dest) == expected:
+            sys.stderr.write(
+                f"mcp-bridge: using cached binary {dest} (sha verified)\n")
+            return dest
+    else:
+        sys.stderr.write(
+            "mcp-bridge: no .sha256 companion for TAI_BINARY URL; "
+            "caching by URL hash without integrity check\n")
+        url_key = hashlib.sha256(spec.encode()).hexdigest()[:16]
+        dest = os.path.join(cache, f"tai-url-{url_key}")
+        if os.path.isfile(dest):
+            sys.stderr.write(f"mcp-bridge: using cached binary {dest}\n")
+            return dest
+
+    sys.stderr.write(f"mcp-bridge: downloading {spec}\n")
+    try:
+        data = _http_get(spec, timeout=DOWNLOAD_TIMEOUT_S)
+    except (urllib.error.URLError, OSError) as e:
+        die(f"failed to download TAI_BINARY from {spec}: {e}")
+
+    if expected is not None:
+        got = hashlib.sha256(data).hexdigest()
+        if got != expected:
+            die(f"sha256 mismatch for {spec}: expected {expected}, got {got}")
+
+    # Atomic publish: write to a temp file in the same dir, chmod, rename.
+    fd, tmp = tempfile.mkstemp(dir=cache, prefix=".tai-dl-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    sys.stderr.write(
+        f"mcp-bridge: cached binary at {dest} "
+        f"({len(data) / 1_048_576:.0f} MB)\n")
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +568,10 @@ def main() -> None:
         die(f"port out of range: {port}", 64)
 
     tai_binary = os.environ.get("TAI_BINARY", DEFAULT_TAI_BINARY)
+
+    # Step 0: a URL spec is downloaded + cached to a local path here;
+    # a local path passes through unchanged.
+    tai_binary = resolve_binary(tai_binary)
 
     # Steps 1–3: ensure the remote is ready.
     ensure_binary(target, tai_binary)
