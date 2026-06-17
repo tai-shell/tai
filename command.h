@@ -73,6 +73,7 @@ enum command_type { cm_for, cm_case, cm_while, cm_if, cm_simple, cm_select,
 		    cm_arith, cm_cond, cm_arith_for, cm_subshell, cm_coproc
 #if defined (AGENT_DISPATCH)
 		    , cm_agent_dispatch
+		    , cm_on_dispatch		/* holo `on [holo:...] body /done' */
 #endif
 		    };
 
@@ -228,6 +229,7 @@ typedef struct command {
     struct coproc_com *Coproc;
 #if defined (AGENT_DISPATCH)
     struct agent_dispatch_com *AgentDispatch;
+    struct on_dispatch_com *OnDispatch;
 #endif
   } value;
 } COMMAND;
@@ -365,6 +367,23 @@ typedef struct agent_dispatch_com {
   AGENT_BLOCK_LINE *block;	/* do…end body, or NULL. */
   struct command *else_action;	/* `else <cmd>' fallback, or NULL. */
 } AGENT_DISPATCH_COM;
+
+/* The "on dispatch" command — sibling of `@' for holo daemon
+   resource dispatch. `on [holo:selector] body /done [else cmd]'.
+   Same parse / AST shape as AGENT_DISPATCH_COM (the parser is
+   shared between `@' and `on'); execution branches at runtime
+   to a Python bridge that talks to a discovered holo daemon
+   over MCP rather than to the `@'-side AI agent transport.
+   See holo/docs/resources.md (Q1, the `on' keyword discussion). */
+typedef struct on_dispatch_com {
+  int flags;
+  int line;
+  WORD_DESC *selector;
+  WORD_DESC *prompt;
+  WORD_DESC *sentinel;
+  AGENT_BLOCK_LINE *block;	/* do…end body, or NULL. */
+  struct command *else_action;	/* `else <cmd>' fallback, or NULL. */
+} ON_DISPATCH_COM;
 #endif
 
 /* The "simple" command.  Just a collection of words and redirects. */

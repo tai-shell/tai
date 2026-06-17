@@ -54,6 +54,7 @@ extern void print_arith_command (WORD_LIST *);
 #endif
 #if defined (AGENT_DISPATCH)
 extern void print_agent_dispatch_command (AGENT_DISPATCH_COM *);
+extern void print_on_dispatch_command (ON_DISPATCH_COM *);
 #endif
 #if defined (COND_COMMAND)
 extern void print_cond_command (COND_COM *);

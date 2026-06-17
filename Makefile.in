@@ -566,8 +566,8 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
 	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O) \
-	   agent_dispatch.o tai_dispatch.o embedded/boot.o embedded/payload.o \
-	   embedded/extract.o
+	   agent_dispatch.o holo_on_dispatch.o tai_dispatch.o embedded/boot.o \
+	   embedded/payload.o embedded/extract.o
 
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
@@ -1413,6 +1413,13 @@ xmalloc.o: ${BASHINCDIR}/stdc.h $(ALLOC_LIBSRC)/shmalloc.h
 
 agent_dispatch.o: config.h config-top.h bashtypes.h bashansi.h ${BASHINCDIR}/ansi_stdlib.h
 agent_dispatch.o: shell.h xmalloc.h externs.h agent_dispatch.h ${BASHINCDIR}/stdc.h
+holo_on_dispatch.o: config.h bashansi.h shell.h holo_on_dispatch.h embedded/boot.h
+# C->Python bridge for the `on' keyword. Needs Python.h on the include
+# path; mirrors embedded/boot.o's pattern (explicit rule to avoid
+# adding Python's include dir to every translation unit's CFLAGS).
+holo_on_dispatch.o: holo_on_dispatch.c
+	$(RM) $@
+	$(CC) -c $(CCFLAGS) $(EMBED_CFLAGS) -o $@ holo_on_dispatch.c
 tai_dispatch.o: config.h bashtypes.h bashansi.h shell.h tai_dispatch.h ${BASHINCDIR}/stdc.h
 
 # job control

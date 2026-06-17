@@ -46,7 +46,11 @@ from collections.abc import Callable
 from typing import Any
 
 from holo.announce import (
+    FIELD_CAPS_PORT,
+    FIELD_CAPS_TOKEN,
     FIELD_IPS,
+    FIELD_R,
+    FIELD_RN,
     FIELD_STARTED,
     FIELD_TUNNEL_PORTS,
     FIELD_V,
@@ -157,6 +161,12 @@ def parse_txt(
                 return None
         elif k == FIELD_IPS:
             # Comma-separated → list[str]. Empty entries are dropped.
+            session[k] = [x.strip() for x in v.split(",") if x.strip()]
+        elif k == FIELD_R or k == FIELD_RN:
+            # Resource tag union (r=) and name list (rn=) — same
+            # comma-csv shape as FIELD_IPS. Decoded to list[str] so
+            # downstream filters can do `in r` membership tests
+            # without re-splitting the string each time.
             session[k] = [x.strip() for x in v.split(",") if x.strip()]
         elif k == FIELD_TUNNEL_PORTS:
             # `<instance>:<port>,...` → {instance: port}. Malformed
@@ -443,28 +453,180 @@ class DiscoverHandle:
 # -------------------------------------------------------------- mode adapters
 
 
-def run_oneshot(wait_s: float = DEFAULT_JSON_WAIT_S) -> int:
-    """`--json` mode: browse for `wait_s`, print snapshot, exit 0."""
+def session_matches_resource_filter(
+    session: dict[str, Any],
+    *,
+    tags: list[str] | None = None,
+    names: list[str] | None = None,
+) -> bool:
+    """True iff the session passes every resource filter (AND across all).
+
+    ``tags`` and ``names`` are AND-joined: every entry must appear in the
+    session's ``r`` / ``rn`` list. Empty / None filters are no-ops (don't
+    constrain). A session that announces no resources at all (missing
+    ``r`` / ``rn``) fails any non-empty filter — there's nothing for the
+    filter to match against.
+
+    Symmetric for tags and names — pass either, both, or neither.
+    """
+    if tags:
+        session_tags = session.get(FIELD_R) or []
+        if not all(t in session_tags for t in tags):
+            return False
+    if names:
+        session_names = session.get(FIELD_RN) or []
+        if not all(n in session_names for n in names):
+            return False
+    return True
+
+
+def fetch_resource_detail(
+    session: dict[str, Any],
+    *,
+    timeout_s: float = 2.0,
+) -> list[dict[str, Any]] | None:
+    """HTTP-fetch /v1/resources for a session and return the parsed list.
+
+    Returns ``None`` when the session can't be fetched from — missing
+    ``caps_port`` / ``caps_token`` (the daemon didn't enable
+    ``--announce-capabilities``), no usable IP, HTTP error, JSON parse
+    error, or auth rejection. Errors log at WARNING but never raise —
+    a single dead session shouldn't fail the surrounding snapshot.
+
+    Returns ``[]`` when the daemon is reachable but announces no
+    resources (legitimate empty response). Distinguishable from
+    ``None`` so callers can tell "fetched, none there" from
+    "couldn't fetch."
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from holo.capabilities_server import CAPS_TOKEN_HEADER
+
+    caps_port = session.get(FIELD_CAPS_PORT)
+    caps_token = session.get(FIELD_CAPS_TOKEN)
+    if not caps_port or not caps_token:
+        return None
+    ips = session.get(FIELD_IPS) or []
+    if not ips:
+        return None
+
+    url = f"http://{ips[0]}:{caps_port}/v1/resources"
+    req = urllib.request.Request(
+        url,
+        headers={CAPS_TOKEN_HEADER: caps_token},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            body = resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        _log.warning(
+            "discover: fetch %s failed: %s",
+            url,
+            e,
+        )
+        return None
+    try:
+        payload = _json.loads(body)
+    except _json.JSONDecodeError as e:
+        _log.warning(
+            "discover: fetch %s returned non-JSON: %s", url, e
+        )
+        return None
+    out = payload.get("resources")
+    if not isinstance(out, list):
+        _log.warning(
+            "discover: fetch %s: payload missing 'resources' list", url
+        )
+        return None
+    return out
+
+
+def run_oneshot(
+    wait_s: float = DEFAULT_JSON_WAIT_S,
+    *,
+    resource_tags: list[str] | None = None,
+    resource_names: list[str] | None = None,
+    fetch_paths: bool = False,
+) -> int:
+    """`--json` mode: browse for `wait_s`, print snapshot, exit 0.
+
+    When ``resource_tags`` / ``resource_names`` are passed, the printed
+    snapshot is filtered client-side via
+    :func:`session_matches_resource_filter`.
+
+    When ``fetch_paths`` is True, each session that announces capabilities
+    (caps_port + caps_token in its TXT) is followed up with a
+    ``GET /v1/resources`` over HTTP, and the parsed list is attached as
+    ``session["resources"]`` (a list of ``{name, path, tags, caps}``
+    dicts). Sessions that don't expose the endpoint are left untouched —
+    they keep their TXT-only ``r``/``rn``/``rcount`` summary but get no
+    detail.
+    """
     zc, _browser, store = _start_browser()
     try:
         time.sleep(wait_s)
         snapshot = store.snapshot()
     finally:
         zc.close()
+    if resource_tags or resource_names:
+        snapshot = [
+            s for s in snapshot
+            if session_matches_resource_filter(
+                s, tags=resource_tags, names=resource_names
+            )
+        ]
+    if fetch_paths:
+        for s in snapshot:
+            detail = fetch_resource_detail(s)
+            if detail is not None:
+                s["resources"] = detail
     json.dump(snapshot, sys.stdout)
     sys.stdout.write("\n")
     sys.stdout.flush()
     return 0
 
 
-def run_tail(stale_after_s: float = DEFAULT_STALE_AFTER_S) -> int:
-    """`--tail` mode: stream JSONL events to stdout until SIGINT/SIGTERM."""
+def run_tail(
+    stale_after_s: float = DEFAULT_STALE_AFTER_S,
+    *,
+    resource_tags: list[str] | None = None,
+    resource_names: list[str] | None = None,
+) -> int:
+    """`--tail` mode: stream JSONL events to stdout until SIGINT/SIGTERM.
+
+    When ``resource_tags`` / ``resource_names`` are passed, events for
+    sessions that don't match the filter are dropped before emit. Note
+    a session that's already in the store at subscribe time emits a
+    synthetic ``add`` (so the filter applies to those too) and that
+    matched sessions whose later ``update`` would also need to match —
+    no special-casing of remove (drop them too if matched-state was
+    invisible to the caller).
+    """
     from holo.mcp_server import _sigterm_as_keyboard_interrupt
 
     zc, _browser, store = _start_browser()
     stop_event = threading.Event()
+    filter_active = bool(resource_tags or resource_names)
+
+    def _event_passes(event: dict[str, Any]) -> bool:
+        if not filter_active:
+            return True
+        if event.get("type") == "remove":
+            # We can't re-check a removed session (it's gone from the
+            # store). Skip remove events under filter — a consumer who
+            # never saw the add won't miss its absence. This is the
+            # same trade-off subscribe-after-snapshot already makes.
+            return False
+        sess = event.get("session") or {}
+        return session_matches_resource_filter(
+            sess, tags=resource_tags, names=resource_names
+        )
 
     def emit(event: dict[str, Any]) -> None:
+        if not _event_passes(event):
+            return
         try:
             sys.stdout.write(json.dumps(event) + "\n")
             sys.stdout.flush()
@@ -1054,8 +1216,10 @@ __all__ = [
     "HoloListener",
     "SessionStore",
     "build_app",
+    "fetch_resource_detail",
     "parse_txt",
     "run_oneshot",
     "run_serve",
     "run_tail",
+    "session_matches_resource_filter",
 ]

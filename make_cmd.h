@@ -57,6 +57,7 @@ extern COMMAND *make_arith_command (WORD_LIST *);
 
 #if defined (AGENT_DISPATCH)
 extern COMMAND *make_agent_dispatch_command (WORD_DESC *, WORD_DESC *, WORD_DESC *, AGENT_BLOCK_LINE *, COMMAND *, int);
+extern COMMAND *make_on_dispatch_command (WORD_DESC *, WORD_DESC *, WORD_DESC *, AGENT_BLOCK_LINE *, COMMAND *, int);
 #endif
 
 extern COMMAND *make_select_command (WORD_DESC *, WORD_LIST *, COMMAND *, int);

@@ -29,6 +29,8 @@ import socket
 import subprocess
 import time
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from holo import __version__
@@ -105,6 +107,30 @@ FIELD_TUNNEL_PORTS = "tunnel_ports"
 # absent + no tmux_session → SPA opens a plain interactive shell.
 FIELD_REMOTE_COMMAND = "remote_command"
 
+# Per-host resource summary fields (added for the resources feature —
+# docs/resources.md §Q5). When the daemon was launched with one or
+# more `--announce-resource ...` flags, these fields carry only the
+# minimum needed to filter by tag or by name from a plain mDNS browse:
+#
+#   r       comma-joined union of every tag across all resources
+#   rn      comma-joined union of resource names (in announce order)
+#   rcount  total resource count (string)
+#
+# Full per-resource detail (path, caps, future stats) is NOT in TXT —
+# it lives behind the existing capabilities-endpoint bearer-token auth
+# at `GET /v1/resources`, and over MCP at `holo_list_resources`. Path
+# and caps are sensitive (paths leak filesystem layout, caps leak the
+# exec surface); the TXT layer says only "this daemon has some
+# video-files resource", not where or with what allowlist.
+#
+# All three fields are omitted when no resources are announced. Adding
+# them does NOT bump TXT_SCHEMA_VERSION — older discoverers ignore
+# unknown TXT keys, which is correct backward-compat behaviour for
+# additive optional fields.
+FIELD_R = "r"
+FIELD_RN = "rn"
+FIELD_RCOUNT = "rcount"
+
 # Required even when other fields are missing. A TXT missing any of these
 # is malformed and should be dropped.
 REQUIRED_FIELDS: tuple[str, ...] = (
@@ -120,10 +146,183 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 # Fields parsed/emitted as integers in the JSON contract. TXT carries them
 # as UTF-8 strings; discover.py converts.
 INT_FIELDS: frozenset[str] = frozenset(
-    {FIELD_HOLO_PID, FIELD_STARTED, FIELD_CAPS_PORT, FIELD_TUNNEL_PORT}
+    {FIELD_HOLO_PID, FIELD_STARTED, FIELD_CAPS_PORT, FIELD_TUNNEL_PORT, FIELD_RCOUNT}
 )
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Resource:
+    """A path the daemon exposes for tagged discovery and (Phase 2+) scoped exec.
+
+    Constructed from CLI specs via :func:`parse_resource_spec` or from a
+    YAML config loader (Phase 2). The TXT broadcast only summarises name
+    + tag union + count (see ``FIELD_R`` / ``FIELD_RN`` / ``FIELD_RCOUNT``);
+    full per-resource detail is served over HTTP / MCP behind cert + token
+    auth.
+
+    Fields are validated at construction:
+      - ``name`` non-empty, no commas (it's joined into TXT's ``rn=``)
+      - ``path`` non-empty (absolute paths are recommended but not
+        enforced — symlink farms and per-user mounts make a hard
+        ``startswith('/')`` check more annoying than useful)
+      - each tag / cap non-empty and comma-free (commas would break
+        the TXT comma-join encoding)
+
+    Caps are stored as opaque strings — Phase 1 publishes them; Phase 2.A
+    enforces the ``exec:NAME`` ones at exec time (allowlist via static
+    parse + PATH pinning). No syntactic check on ``readonly`` /
+    ``uid:NAME`` shape yet, so an experimental cap can be announced
+    without an announcer-side allowlist edit.
+
+    ``allow_principals`` is a documented intent surface for Phase 2.B:
+    "only these principals may exec in this resource." **It is NOT
+    enforced in v1.** The holo cert architecture today uses a single
+    fixed principal (``lando``) at the SSH layer and provides no
+    per-call identity to the MCP layer where exec runs. The field is
+    parsed, surfaced via ``/v1/resources`` / ``holo_list_resources``,
+    and logged informationally — but the cert chain on the MCP channel
+    is the only access gate that actually fires. Multi-principal use
+    needs a real identity story (cert subjects with per-user
+    principals, plumbed SSH→MCP — both deferred).
+    """
+
+    name: str
+    path: str
+    tags: tuple[str, ...] = field(default_factory=tuple)
+    caps: tuple[str, ...] = field(default_factory=tuple)
+    allow_principals: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("resource: name is required")
+        if "," in self.name:
+            raise ValueError(
+                f"resource: name {self.name!r} may not contain ',' "
+                "(used as TXT field separator)"
+            )
+        if not self.path:
+            raise ValueError(
+                f"resource {self.name!r}: path is required"
+            )
+        for t in self.tags:
+            if not t:
+                raise ValueError(
+                    f"resource {self.name!r}: empty tag"
+                )
+            if "," in t:
+                raise ValueError(
+                    f"resource {self.name!r}: tag {t!r} may not contain ','"
+                )
+        for c in self.caps:
+            if not c:
+                raise ValueError(
+                    f"resource {self.name!r}: empty cap"
+                )
+            if "," in c:
+                raise ValueError(
+                    f"resource {self.name!r}: cap {c!r} may not contain ','"
+                )
+        for p in self.allow_principals:
+            if not p:
+                raise ValueError(
+                    f"resource {self.name!r}: empty principal"
+                )
+            if "," in p:
+                raise ValueError(
+                    f"resource {self.name!r}: principal {p!r} may not "
+                    "contain ','"
+                )
+
+
+def parse_resource_spec(spec: str) -> Resource:
+    """Parse a `--announce-resource SPEC` string into a :class:`Resource`.
+
+    SPEC syntax: semicolon-separated ``key=value`` pairs.
+
+      name=<str>;path=<str>;tags=<csv>;caps=<csv>;allow_principals=<csv>
+
+    Semicolon was picked over comma at the top level because ``tags=``
+    / ``caps=`` / ``allow_principals=`` themselves carry comma lists —
+    a single-level comma-split is ambiguous (where does ``tags=`` end?).
+    Inside the list fields, commas separate entries.
+
+    Whitespace around keys, values, and list entries is stripped.
+    Unknown keys raise — silently dropping them would let typos
+    (``name=`` vs ``names=``) ship empty fields.
+
+    Example::
+
+        parse_resource_spec(
+            'name=movies;path=/Volumes/movies;'
+            'tags=video-files,archive;'
+            'caps=exec:ffprobe,exec:python3,readonly;'
+            'allow_principals=alice@laptop,bob@office'
+        )
+
+    Note: ``allow_principals`` is parsed and surfaced but **not
+    enforced in v1** — see :class:`Resource` for the why.
+    """
+    if not spec or not spec.strip():
+        raise ValueError("resource spec is empty")
+    fields: dict[str, str] = {}
+    for pair in spec.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"resource spec: {pair!r} missing '=' "
+                "(expected key=value, semicolon-separated)"
+            )
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key in fields:
+            raise ValueError(
+                f"resource spec: duplicate key {key!r}"
+            )
+        fields[key] = value
+
+    allowed = {"name", "path", "tags", "caps", "allow_principals"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(
+            f"resource spec: unknown keys {sorted(unknown)} "
+            f"(allowed: {sorted(allowed)})"
+        )
+
+    def _csv(raw: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+    return Resource(
+        name=fields.get("name", ""),
+        path=fields.get("path", ""),
+        tags=_csv(fields.get("tags", "")),
+        caps=_csv(fields.get("caps", "")),
+        allow_principals=_csv(fields.get("allow_principals", "")),
+    )
+
+
+def _resources_to_txt_props(resources: Sequence[Resource]) -> dict[str, str]:
+    """Build the three TXT summary fields for a list of resources.
+
+    Returns an empty dict when ``resources`` is empty so callers can
+    skip the ``put()`` calls entirely. Names appear in announce order
+    (it's an addressing key — order may carry user intent); tags are
+    sorted for stable, predictable TXT bytes regardless of resource
+    enumeration order.
+    """
+    if not resources:
+        return {}
+    tag_union = sorted({t for r in resources for t in r.tags})
+    name_union = [r.name for r in resources]
+    return {
+        FIELD_R: ",".join(tag_union),
+        FIELD_RN: ",".join(name_union),
+        FIELD_RCOUNT: str(len(resources)),
+    }
 
 
 class HoloAnnouncer:
@@ -146,6 +345,7 @@ class HoloAnnouncer:
         caps_port: int | None = None,
         caps_token: str | None = None,
         remote_command: str | None = None,
+        resources: Sequence[Resource] | None = None,
     ) -> None:
         self.session = session
         self.user = user or getpass.getuser()
@@ -168,6 +368,18 @@ class HoloAnnouncer:
             )
         self.caps_port = caps_port
         self.caps_token = caps_token
+        # Per-host resources (see docs/resources.md). Duplicate names
+        # are rejected here rather than at TXT-build time so the error
+        # surfaces at daemon startup, not the next time someone calls
+        # build_properties().
+        seen_names: set[str] = set()
+        for r in resources or ():
+            if r.name in seen_names:
+                raise ValueError(
+                    f"resources: duplicate name {r.name!r}"
+                )
+            seen_names.add(r.name)
+        self.resources: tuple[Resource, ...] = tuple(resources or ())
         # Tunnel port (Phase 4b) starts unset; ``set_tunnel_port`` flips
         # it on/off. When set, included in the broadcast TXT record so
         # the desktop SPA can route through it.
@@ -231,6 +443,9 @@ class HoloAnnouncer:
         #   3. omit the field; SPA falls back to legacy paths
         cmd = self.remote_command or _default_remote_command()
         put(FIELD_REMOTE_COMMAND, cmd)
+
+        for key, value in _resources_to_txt_props(self.resources).items():
+            put(key, value)
 
         return props
 
@@ -611,6 +826,9 @@ __all__ = [
     "FIELD_HOLO_VERSION",
     "FIELD_HOST",
     "FIELD_IPS",
+    "FIELD_R",
+    "FIELD_RCOUNT",
+    "FIELD_RN",
     "FIELD_SESSION",
     "FIELD_SSH_USER",
     "FIELD_STARTED",
@@ -624,7 +842,9 @@ __all__ = [
     "HoloAnnouncer",
     "INT_FIELDS",
     "REQUIRED_FIELDS",
+    "Resource",
     "SERVICE_TYPE",
     "TXT_SCHEMA_VERSION",
+    "parse_resource_spec",
     "parse_tunnel_ports",
 ]

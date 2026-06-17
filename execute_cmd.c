@@ -77,6 +77,7 @@ extern int errno;
 #include "findcmd.h"
 #if defined (AGENT_DISPATCH)
 #  include "agent_dispatch.h"
+#  include "holo_on_dispatch.h"
 #endif
 #include "redir.h"
 #include "trap.h"
@@ -147,6 +148,7 @@ static int execute_arith_command (ARITH_COM *);
 #endif
 #if defined (AGENT_DISPATCH)
 static int execute_agent_dispatch_command (AGENT_DISPATCH_COM *);
+static int execute_on_dispatch_command (ON_DISPATCH_COM *);
 #endif
 #if defined (COND_COMMAND)
 static int execute_cond_node (COND_COM *);
@@ -1185,6 +1187,10 @@ execute_command_internal (COMMAND *command, int asynchronous, int pipe_in, int p
 #if defined (AGENT_DISPATCH)
     case cm_agent_dispatch:
       exec_result = execute_agent_dispatch_command (command->value.AgentDispatch);
+      break;
+
+    case cm_on_dispatch:
+      exec_result = execute_on_dispatch_command (command->value.OnDispatch);
       break;
 #endif
 
@@ -3990,6 +3996,43 @@ execute_agent_dispatch_command (AGENT_DISPATCH_COM *agent_command)
 
   if (exec_result != EXECUTION_SUCCESS && agent_command->else_action)
     return execute_command (agent_command->else_action);
+
+  return exec_result;
+}
+
+/* tai holo "on" dispatch -- routes the parsed AST node through the
+   C->Python bridge in holo_on_dispatch.c, which calls
+   tai_runtime.holo_on.dispatch.dispatch_from_c. Output streams are
+   written to the tai process stdout/stderr by the Python runtime.
+   else_action runs only when the dispatch returns non-zero. */
+static int
+execute_on_dispatch_command (ON_DISPATCH_COM *on_command)
+{
+  const char *sel_raw = (on_command->selector && on_command->selector->word)
+    ? on_command->selector->word : "";
+  const char *body_raw = (on_command->prompt && on_command->prompt->word)
+    ? on_command->prompt->word : "";
+  const char *sentinel = (on_command->sentinel && on_command->sentinel->word)
+    ? on_command->sentinel->word : (const char *)NULL;
+
+  /* Phase 3.B.3: do..end block form is parsed but not yet routed --
+     the design doc covers it under Phase 3.D alongside modes. For
+     now, an `on .. do .. end' compiles and the block AST is built,
+     but execution dispatches only the single-line form. */
+  if (on_command->block)
+    {
+      fprintf (stderr,
+	       "tai: `on .. do .. end' block form not yet supported "
+	       "(Phase 3.D); selector=%s\n", sel_raw);
+      if (on_command->else_action)
+	return execute_command (on_command->else_action);
+      return EXECUTION_FAILURE;
+    }
+
+  int exec_result = holo_on_dispatch_call (sel_raw, body_raw, sentinel);
+
+  if (exec_result != EXECUTION_SUCCESS && on_command->else_action)
+    return execute_command (on_command->else_action);
 
   return exec_result;
 }

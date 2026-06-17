@@ -297,6 +297,7 @@ def _cmd_mcp(
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> int:
@@ -361,8 +362,16 @@ def _cmd_mcp(
                 label_bits.append(f"user={announce_user}")
             if announce_ips:
                 label_bits.append(f"ips={','.join(announce_ips)}")
+            if announce_resources:
+                label_bits.append(f"resources={len(announce_resources)}")
             label = " ".join(label_bits) if label_bits else "(defaults)"
             lines.append(f"mDNS announce: enabled — {label}")
+            for r in announce_resources or ():
+                tag_part = f" tags={','.join(r.tags)}" if r.tags else ""
+                cap_part = f" caps={','.join(r.caps)}" if r.caps else ""
+                lines.append(
+                    f"  resource: {r.name} → {r.path}{tag_part}{cap_part}"
+                )
         if announce_capabilities:
             lines.append(
                 "Capabilities endpoint: enabled "
@@ -387,6 +396,7 @@ def _cmd_mcp(
         "announce_ips": announce_ips,
         "announce_capabilities": announce_capabilities,
         "announce_command": announce_command,
+        "announce_resources": announce_resources,
         "auto_tunnel": auto_tunnel,
         "auto_tunnel_backend": auto_tunnel_backend,
     }
@@ -713,6 +723,19 @@ _DISCOVER_USAGE = (
     "                          is preserved across the swap so /sessions\n"
     "                          stays continuous; defends against silent\n"
     "                          browse stalls.\n"
+    "  --resource-tag X        --json/--tail: filter to sessions whose r=\n"
+    "                          TXT union contains X. Repeatable; all must\n"
+    "                          match (AND). Sessions announcing no resources\n"
+    "                          are dropped when any filter is set.\n"
+    "  --resource-name X       --json/--tail: filter to sessions whose rn=\n"
+    "                          TXT list contains X. Repeatable; AND.\n"
+    "  --fetch-paths           --json only: after the browse, HTTP-fetch\n"
+    "                          /v1/resources from each session announcing\n"
+    "                          capabilities (caps_port + caps_token); attach\n"
+    "                          the full per-resource records as\n"
+    "                          session['resources'] in the output. Sessions\n"
+    "                          that don't expose the endpoint are left with\n"
+    "                          their TXT-only summary.\n"
     "  --cors-origin O         comma-separated CORS allow-list "
     "(default: http://localhost:8888,https://app-dev.tai.sh)"
 )
@@ -813,10 +836,44 @@ def _cmd_discover(rest: list[str]) -> int:
             )
             return 2
 
+    resource_tag_raw = _all_values_flag(rest, "--resource-tag")
+    if resource_tag_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --resource-tag requires a value\n")
+        return 2
+    resource_name_raw = _all_values_flag(rest, "--resource-name")
+    if resource_name_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --resource-name requires a value\n")
+        return 2
+    resource_tags = resource_tag_raw if resource_tag_raw else None
+    resource_names = resource_name_raw if resource_name_raw else None
+    if (resource_tags or resource_names) and serve_port_raw is not None:
+        sys.stderr.write(
+            "holo discover: --resource-tag / --resource-name apply to "
+            "--json / --tail only; for --serve, filter via the HTTP "
+            "query layer.\n"
+        )
+        return 2
+
+    fetch_paths = "--fetch-paths" in rest
+    if fetch_paths and not json_mode:
+        sys.stderr.write(
+            "holo discover: --fetch-paths applies to --json only\n"
+        )
+        return 2
+
     if json_mode:
-        return discover.run_oneshot(wait_s=wait_s)
+        return discover.run_oneshot(
+            wait_s=wait_s,
+            resource_tags=resource_tags,  # type: ignore[arg-type]
+            resource_names=resource_names,  # type: ignore[arg-type]
+            fetch_paths=fetch_paths,
+        )
     if tail_mode:
-        return discover.run_tail(stale_after_s=stale_after_s)
+        return discover.run_tail(
+            stale_after_s=stale_after_s,
+            resource_tags=resource_tags,  # type: ignore[arg-type]
+            resource_names=resource_names,  # type: ignore[arg-type]
+        )
     # --serve
     assert isinstance(serve_port_raw, str)  # _value_flag already returned a str
     try:
@@ -1395,6 +1452,8 @@ Commands:
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
       [--announce-capabilities] [--announce-command "CMD"]
+      [--announce-resource "name=…;path=…;tags=…;caps=…"]...
+      [--resources-config PATH]
       [--auto-tunnel] [--auto-tunnel-backend URL]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
@@ -1446,6 +1505,35 @@ Commands:
                                                      wrappers (e.g. for Homebrew
                                                      PATH), or REPLs. Published
                                                      verbatim in the announce.
+                          --announce-resource SPEC   declare a per-host resource
+                                                     (path + tags + caps) for
+                                                     tagged discovery. Repeatable.
+                                                     SPEC is semicolon-separated
+                                                     key=value pairs:
+                                                       name=movies
+                                                       path=/Volumes/movies
+                                                       tags=video-files,archive
+                                                       caps=exec:ffprobe,readonly
+                                                       allow_principals=alice@laptop
+                                                     TXT broadcasts only the tag
+                                                     union + name list; full
+                                                     records (path, caps) are
+                                                     fetched over the same auth as
+                                                     --announce-capabilities. See
+                                                     docs/resources.md.
+                          --resources-config PATH    load resources from a TOML
+                                                     file instead of --announce-
+                                                     resource flags. Format:
+                                                       [resources.movies]
+                                                       path = "/Volumes/movies"
+                                                       tags = ["video-files"]
+                                                       caps = ["exec:ffprobe"]
+                                                       allow_principals = ["alice"]
+                                                     Mutually exclusive with
+                                                     --announce-resource. See
+                                                     ~/.config/holo/resources.toml
+                                                     for the canonical default
+                                                     location.
                           --auto-tunnel              open reverse SSH forwards into
                                                      every discovered CloudCity
                                                      (one tunnel per CC); the
@@ -1461,8 +1549,15 @@ Commands:
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
   discover [--json | --tail | --serve PORT] [--wait SECS]
            [--stale-after SECS] [--cors-origin O,O,...]
+           [--resource-tag X]... [--resource-name X]... [--fetch-paths]
                           discover live `_holo-session._tcp.local.` broadcasts
-                          (reference consumer for docs/companion-spec.md)
+                          (reference consumer for docs/companion-spec.md).
+                          --resource-tag/--resource-name (--json/--tail only):
+                          repeatable client-side filter on the resource TXT
+                          summary fields (r=, rn=); ANDed within and across.
+                          --fetch-paths (--json only): follow up the browse
+                          with /v1/resources HTTP fetches to attach paths +
+                          caps to each session that exposes them.
   cloudcity announce [--port PORT] [--ips A,B,...] [--backend URL]
                      [--ca-fps FP[,FP...]] [--instance NAME]
                           broadcast a `_cloudcity._tcp.local.` mDNS service
@@ -1531,6 +1626,30 @@ def _value_flag(rest: list[str], flag: str) -> str | None | object:
     return value
 
 
+def _all_values_flag(rest: list[str], flag: str) -> list[str] | object:
+    """Read every `--flag VALUE` pair from `rest`, in order.
+
+    For repeatable flags (e.g. ``--announce-resource SPEC``). Returns
+    an empty list if the flag never appears; returns ``_MISSING_ARG``
+    if any occurrence is missing a value (consistent with
+    :func:`_value_flag`'s contract).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(rest):
+        if rest[i] != flag:
+            i += 1
+            continue
+        if i + 1 >= len(rest):
+            return _MISSING_ARG
+        value = rest[i + 1]
+        if value.startswith("--"):
+            return _MISSING_ARG
+        out.append(value)
+        i += 2
+    return out
+
+
 def _print_update_notice_if_any() -> None:
     """Append a one-line `Update available: …` notice after the help
     screen when a newer release is on GitHub. Silent on cache miss,
@@ -1592,6 +1711,8 @@ def main(argv: list[str] | None = None) -> int:
         announce_ssh_user = _value_flag(rest, "--announce-ssh-user")
         announce_ip_raw = _value_flag(rest, "--announce-ip")
         announce_command_raw = _value_flag(rest, "--announce-command")
+        announce_resource_raw = _all_values_flag(rest, "--announce-resource")
+        resources_config_raw = _value_flag(rest, "--resources-config")
         announce = "--announce" in rest
         announce_capabilities = "--announce-capabilities" in rest
         auto_tunnel = "--auto-tunnel" in rest
@@ -1616,14 +1737,19 @@ def main(argv: list[str] | None = None) -> int:
             or announce_ip_raw is not None
             or announce_capabilities
             or announce_command_raw is not None
+            or (
+                isinstance(announce_resource_raw, list)
+                and announce_resource_raw
+            )
+            or resources_config_raw is not None
             or auto_tunnel
             or auto_tunnel_backend_raw is not None
         ):
             sys.stderr.write(
                 "holo mcp: --announce-session/--announce-user/"
                 "--announce-ssh-user/--announce-ip/--announce-capabilities/"
-                "--announce-command/--auto-tunnel/--auto-tunnel-backend "
-                "require --announce\n"
+                "--announce-command/--announce-resource/--resources-config/"
+                "--auto-tunnel/--auto-tunnel-backend require --announce\n"
             )
             return 2
         if announce_session is _MISSING_ARG:
@@ -1643,6 +1769,28 @@ def main(argv: list[str] | None = None) -> int:
                 "holo mcp: --announce-command requires a value\n"
             )
             return 2
+        if announce_resource_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --announce-resource requires a value\n"
+            )
+            return 2
+        if resources_config_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --resources-config requires a path\n"
+            )
+            return 2
+        if (
+            isinstance(announce_resource_raw, list)
+            and announce_resource_raw
+            and isinstance(resources_config_raw, str)
+        ):
+            sys.stderr.write(
+                "holo mcp: --announce-resource and --resources-config "
+                "are mutually exclusive — declare resources in one "
+                "place. Move CLI specs into the TOML file (see "
+                "docs/resources.md) or drop the file.\n"
+            )
+            return 2
         if auto_tunnel_backend_raw is _MISSING_ARG:
             sys.stderr.write(
                 "holo mcp: --auto-tunnel-backend requires a value\n"
@@ -1658,6 +1806,42 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(
                     "holo mcp: --announce-ip requires at least one IP\n"
                 )
+                return 2
+
+        announce_resources: list[Any] | None = None
+        if isinstance(announce_resource_raw, list) and announce_resource_raw:
+            from holo.announce import parse_resource_spec
+
+            announce_resources = []
+            seen_names: set[str] = set()
+            for spec in announce_resource_raw:
+                try:
+                    res = parse_resource_spec(spec)
+                except ValueError as e:
+                    sys.stderr.write(
+                        f"holo mcp: --announce-resource {spec!r}: {e}\n"
+                    )
+                    return 2
+                if res.name in seen_names:
+                    sys.stderr.write(
+                        f"holo mcp: --announce-resource: duplicate "
+                        f"name {res.name!r}\n"
+                    )
+                    return 2
+                seen_names.add(res.name)
+                announce_resources.append(res)
+        elif isinstance(resources_config_raw, str):
+            from holo.resources_config import (
+                ResourcesConfigError,
+                load_resources_toml,
+            )
+
+            try:
+                announce_resources = list(
+                    load_resources_toml(resources_config_raw)
+                )
+            except ResourcesConfigError as e:
+                sys.stderr.write(f"holo mcp: {e}\n")
                 return 2
 
         auto_tunnel_backend = (
@@ -1736,6 +1920,7 @@ def main(argv: list[str] | None = None) -> int:
             announce_ips=announce_ips,
             announce_capabilities=announce_capabilities,
             announce_command=announce_command,
+            announce_resources=announce_resources,
             auto_tunnel=auto_tunnel,
             auto_tunnel_backend=auto_tunnel_backend,
         )
