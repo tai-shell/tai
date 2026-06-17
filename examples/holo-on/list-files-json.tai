@@ -1,0 +1,26 @@
+#!/usr/local/bin/tai
+# list-files-json.tai — fan out a `find` across every host
+# announcing `video-files`, emit results as JSONL with per-frame
+# host/resource attribution.
+#
+# Demonstrates the `:json` selector suffix. Every line of stdout
+# AND stderr from the dispatched bodies arrives on this script's
+# stdout as one JSON object:
+#
+#   {"host": "...", "resource": "...", "fd": "stdout", "data": "..."}
+#
+# Stderr is routed to stdout in `:json` mode so a single pipe
+# captures the full stream — handy for piping into `jq`, a
+# database loader, etc.
+
+on [holo:tag=video-files:5m:settle=3000ms:json] \
+   find . -type f -name "*.mp4" /done
+
+# Sample consumer pattern (commented out so the script works
+# without jq installed):
+#
+#   ./list-files-json.tai | jq -r 'select(.fd=="stdout") | "\(.host)\t\(.data)"' \
+#     | sort -u
+#
+# would produce one tab-separated `host\trelpath` line per .mp4 file
+# across the fleet, deduplicated.

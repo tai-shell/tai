@@ -1,0 +1,28 @@
+#!/usr/local/bin/tai
+# count-mp4s.tai — count *.mp4 files across every holo daemon
+# announcing a `video-files` resource on the LAN.
+#
+# The shortest useful `on` invocation: a single broadcast dispatch
+# with a single pipeline body. Each matching daemon runs
+# `find . -type f -name "*.mp4" | wc -l` in the resource path and
+# emits the line count to this script's stdout.
+#
+# Default mode → stdout is the raw line counts, one per matched
+# (host, resource). Stderr is always host-prefixed so failures
+# are attributable without the body having to self-tag.
+#
+# Setup the daemons need:
+#   holo mcp --announce --resources-config ~/.config/holo/resources.toml
+# where the toml declares a resource with caps=["exec:find","exec:wc"]
+# and tags=["video-files"].
+
+on [holo:tag=video-files:5m:settle=3000ms] \
+   find . -type f -name "*.mp4" | wc -l /done
+
+# After dispatch, ${ON_HOSTS[@]} carries the per-host exit codes as
+# "host:exit" strings. Useful for "did anyone fail?" checks.
+echo
+echo "per-host exits:"
+for entry in "${ON_HOSTS[@]}"; do
+  echo "  $entry"
+done
