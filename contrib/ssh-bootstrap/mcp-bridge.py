@@ -316,27 +316,38 @@ def fire_listener(target: str, port: int) -> str:
             "mcp-bridge: firing launcher inside Terminal.app on remote\n")
         # Use osascript directly (not `open`) so the bounds-snap runs
         # as the very next AppleScript statement after `do script`,
-        # with no `bash → osascript` startup gap in between. Then
-        # hide Terminal entirely via System Events so any stray
-        # window can't steal focus or remain on screen.
-        applescript_lines = [
+        # with no `bash → osascript` startup gap in between. This is
+        # the ESSENTIAL step — it starts the listener and snaps the
+        # window offscreen — so it runs check=True.
+        essential_lines = [
             'tell application "Terminal"',
             f'  do script "{DEFAULT_REMOTE_LAUNCHER_PATH}"',
             '  set bounds of front window to {-10000, -10000, -9900, -9900}',
-            'end tell',
-            'tell application "System Events"',
-            '  set visible of process "Terminal" to false',
             'end tell',
         ]
         # Each AppleScript line as a separate -e arg. Single-quote
         # each in the shell command; the script's literal { and }
         # bounds-tuple braces are safe inside the single quotes.
-        ascript = " ".join(
-            "-e " + _sh_squote(line) for line in applescript_lines
+        essential = " ".join(
+            "-e " + _sh_squote(line) for line in essential_lines
         )
         _ssh(target,
-             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && osascript {ascript}",
+             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && osascript {essential}",
              check=True)
+
+        # Then hide Terminal entirely via System Events so any stray
+        # window can't steal focus or remain on screen. This is purely
+        # cosmetic — the window is already snapped offscreen above — and
+        # on some hosts `set visible … to false` drops the ssh session
+        # ("connection closed by remote host"), so it must NOT be allowed
+        # to abort bootstrap. Best-effort: check=False.
+        hide_lines = [
+            'tell application "System Events"',
+            '  set visible of process "Terminal" to false',
+            'end tell',
+        ]
+        hide = " ".join("-e " + _sh_squote(line) for line in hide_lines)
+        _ssh(target, f"osascript {hide}", check=False)
     finally:
         os.unlink(local_launcher)
 
