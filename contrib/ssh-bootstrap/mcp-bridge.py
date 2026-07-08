@@ -316,27 +316,38 @@ def fire_listener(target: str, port: int) -> str:
             "mcp-bridge: firing launcher inside Terminal.app on remote\n")
         # Use osascript directly (not `open`) so the bounds-snap runs
         # as the very next AppleScript statement after `do script`,
-        # with no `bash → osascript` startup gap in between. Then
-        # hide Terminal entirely via System Events so any stray
-        # window can't steal focus or remain on screen.
-        applescript_lines = [
+        # with no `bash → osascript` startup gap in between. This is
+        # the ESSENTIAL step — it starts the listener and snaps the
+        # window offscreen — so it runs check=True.
+        essential_lines = [
             'tell application "Terminal"',
             f'  do script "{DEFAULT_REMOTE_LAUNCHER_PATH}"',
             '  set bounds of front window to {-10000, -10000, -9900, -9900}',
-            'end tell',
-            'tell application "System Events"',
-            '  set visible of process "Terminal" to false',
             'end tell',
         ]
         # Each AppleScript line as a separate -e arg. Single-quote
         # each in the shell command; the script's literal { and }
         # bounds-tuple braces are safe inside the single quotes.
-        ascript = " ".join(
-            "-e " + _sh_squote(line) for line in applescript_lines
+        essential = " ".join(
+            "-e " + _sh_squote(line) for line in essential_lines
         )
         _ssh(target,
-             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && osascript {ascript}",
+             f"chmod +x {DEFAULT_REMOTE_LAUNCHER_PATH} && osascript {essential}",
              check=True)
+
+        # Then hide Terminal entirely via System Events so any stray
+        # window can't steal focus or remain on screen. This is purely
+        # cosmetic — the window is already snapped offscreen above — and
+        # on some hosts `set visible … to false` drops the ssh session
+        # ("connection closed by remote host"), so it must NOT be allowed
+        # to abort bootstrap. Best-effort: check=False.
+        hide_lines = [
+            'tell application "System Events"',
+            '  set visible of process "Terminal" to false',
+            'end tell',
+        ]
+        hide = " ".join("-e " + _sh_squote(line) for line in hide_lines)
+        _ssh(target, f"osascript {hide}", check=False)
     finally:
         os.unlink(local_launcher)
 
@@ -519,24 +530,42 @@ def cleanup_remote(target: str) -> None:
     log and leave a process running on the remote.
 
     Set MCP_BRIDGE_KEEP_TRACES=1 in env to skip cleanup for
-    debugging (preserve logs etc. on the remote for inspection)."""
+    debugging (preserve logs etc. on the remote for inspection).
+
+    Set MCP_BRIDGE_KEEP_BINARY=1 to preserve only the binary
+    ({DEFAULT_REMOTE_BINARY_PATH}) across sessions — the sensitive
+    per-session token, launcher, log, symlink, and cache tree are
+    still wiped, but the next session finds the sha-matching binary
+    already present and skips the (~191 MB) re-ship. Trades a resident
+    binary on the remote for fast reconnects; default (unset) is the
+    full agentless wipe."""
     if os.environ.get("MCP_BRIDGE_KEEP_TRACES") == "1":
         sys.stderr.write(
             "mcp-bridge: cleanup skipped (MCP_BRIDGE_KEEP_TRACES=1)\n")
         return
 
-    sys.stderr.write(f"mcp-bridge: wiping {target} (agentless cleanup)\n")
+    keep_binary = os.environ.get("MCP_BRIDGE_KEEP_BINARY") == "1"
+    sys.stderr.write(
+        f"mcp-bridge: wiping {target} (agentless cleanup"
+        f"{', keeping binary' if keep_binary else ''})\n")
     # Single shell command so we only pay one ssh round-trip. Kill the
     # listener + any SikuliX JVM first (best-effort; pkill is fine if
     # they already exited), then remove files. `rm`s tolerate missing
     # files; the rm -rf of the cache dir cleans up any extracted-payload
-    # subdirs in one shot.
+    # subdirs in one shot. When keep_binary is set, /tmp/tai is left in
+    # place so the next session's sha-check skips the re-ship.
+    removable = [
+        DEFAULT_REMOTE_TCSH_LINK,
+        DEFAULT_REMOTE_LAUNCHER_PATH,
+        DEFAULT_TOKEN_PATH,
+        DEFAULT_REMOTE_LOG_PATH,
+    ]
+    if not keep_binary:
+        removable.insert(0, DEFAULT_REMOTE_BINARY_PATH)
     cmd = (
         f"pkill -f '^{DEFAULT_REMOTE_TCSH_LINK} --listen' 2>/dev/null; "
         f"pkill -f sikulixapi 2>/dev/null; "
-        f"rm -f {DEFAULT_REMOTE_BINARY_PATH} {DEFAULT_REMOTE_TCSH_LINK} "
-        f"{DEFAULT_REMOTE_LAUNCHER_PATH} {DEFAULT_TOKEN_PATH} "
-        f"{DEFAULT_REMOTE_LOG_PATH}; "
+        f"rm -f {' '.join(removable)}; "
         f"rm -rf {DEFAULT_REMOTE_CACHE_DIR}"
     )
     try:
