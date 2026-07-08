@@ -530,24 +530,42 @@ def cleanup_remote(target: str) -> None:
     log and leave a process running on the remote.
 
     Set MCP_BRIDGE_KEEP_TRACES=1 in env to skip cleanup for
-    debugging (preserve logs etc. on the remote for inspection)."""
+    debugging (preserve logs etc. on the remote for inspection).
+
+    Set MCP_BRIDGE_KEEP_BINARY=1 to preserve only the binary
+    ({DEFAULT_REMOTE_BINARY_PATH}) across sessions — the sensitive
+    per-session token, launcher, log, symlink, and cache tree are
+    still wiped, but the next session finds the sha-matching binary
+    already present and skips the (~191 MB) re-ship. Trades a resident
+    binary on the remote for fast reconnects; default (unset) is the
+    full agentless wipe."""
     if os.environ.get("MCP_BRIDGE_KEEP_TRACES") == "1":
         sys.stderr.write(
             "mcp-bridge: cleanup skipped (MCP_BRIDGE_KEEP_TRACES=1)\n")
         return
 
-    sys.stderr.write(f"mcp-bridge: wiping {target} (agentless cleanup)\n")
+    keep_binary = os.environ.get("MCP_BRIDGE_KEEP_BINARY") == "1"
+    sys.stderr.write(
+        f"mcp-bridge: wiping {target} (agentless cleanup"
+        f"{', keeping binary' if keep_binary else ''})\n")
     # Single shell command so we only pay one ssh round-trip. Kill the
     # listener + any SikuliX JVM first (best-effort; pkill is fine if
     # they already exited), then remove files. `rm`s tolerate missing
     # files; the rm -rf of the cache dir cleans up any extracted-payload
-    # subdirs in one shot.
+    # subdirs in one shot. When keep_binary is set, /tmp/tai is left in
+    # place so the next session's sha-check skips the re-ship.
+    removable = [
+        DEFAULT_REMOTE_TCSH_LINK,
+        DEFAULT_REMOTE_LAUNCHER_PATH,
+        DEFAULT_TOKEN_PATH,
+        DEFAULT_REMOTE_LOG_PATH,
+    ]
+    if not keep_binary:
+        removable.insert(0, DEFAULT_REMOTE_BINARY_PATH)
     cmd = (
         f"pkill -f '^{DEFAULT_REMOTE_TCSH_LINK} --listen' 2>/dev/null; "
         f"pkill -f sikulixapi 2>/dev/null; "
-        f"rm -f {DEFAULT_REMOTE_BINARY_PATH} {DEFAULT_REMOTE_TCSH_LINK} "
-        f"{DEFAULT_REMOTE_LAUNCHER_PATH} {DEFAULT_TOKEN_PATH} "
-        f"{DEFAULT_REMOTE_LOG_PATH}; "
+        f"rm -f {' '.join(removable)}; "
         f"rm -rf {DEFAULT_REMOTE_CACHE_DIR}"
     )
     try:

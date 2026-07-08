@@ -138,8 +138,14 @@ Claude can now call `screen_move`, `screen_click`, `screen_type`,
 | `TAI_REMOTE_TOKEN_PATH` | `/tmp/tai-token` | Where the launcher writes the token on B. |
 | `TAI_LOCAL_TOKEN_PATH` | `/tmp/tai-bridge-token` | Local copy on A. mcp-bridge.py doesn't use this (it re-fetches from B) — it's kept for operator inspection. |
 
-`mcp-bridge.py` reads no env vars; everything's positional argv so
-Claude's spawn config controls all the knobs.
+`mcp-bridge.py` (host + port are positional argv; these env vars are
+optional and typically set in Claude's spawn config):
+
+| Var | Default | Notes |
+|---|---|---|
+| `TAI_BINARY` | `/usr/local/bin/tai` | Path **or** `http(s)` URL to the tai-bundled binary on A. A URL is downloaded once and cached under `~/Library/Caches/tai/downloads/`. |
+| `MCP_BRIDGE_KEEP_BINARY` | unset | `=1` preserves only `/tmp/tai` on B across sessions (token, launcher, log, symlink, and cache are still wiped) so the next session's sha-check skips the ~191 MB re-ship. Trades a resident binary on B for fast reconnects. |
+| `MCP_BRIDGE_KEEP_TRACES` | unset | `=1` skips cleanup entirely (leaves logs etc. on B for debugging). |
 
 ## Troubleshooting
 
