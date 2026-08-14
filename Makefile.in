@@ -170,15 +170,68 @@ EMBED_CFLAGS = -I$(EMBED_CPYTHON_PREFIX)/include/python3.13
 # error) when CPython hasn't been built — run `make -C embedded
 # cpython` first.
 EMBED_PYCFG = $(EMBED_CPYTHON_PREFIX)/bin/python3.13-config
-# Filter -lintl: bash already bundles libintl statically via
-# lib/intl/libintl.a (which links earlier in the command line and
-# is universal2 because it's built with bash's CFLAGS). CPython's
-# --ldflags --embed adds another -lintl that the linker then tries
-# to satisfy from the system search path. On Apple Silicon (CI),
-# Homebrew lives at /opt/homebrew/lib which isn't on the linker's
-# default search path; dropping the duplicate lets bash's bundled
-# libintl satisfy libpython3.13.a's gettext references.
-EMBED_LIBS := $(filter-out -lintl,$(shell test -x $(EMBED_PYCFG) && $(EMBED_PYCFG) --ldflags --embed))
+# libpython3.13.a references _libintl_* (via _localemodule.o), and
+# CPython's `--ldflags --embed` emits a bare `-lintl` with no -L to
+# find it, because Homebrew's gettext is keg-only and sits outside
+# the linker's default search path. Which side satisfies those
+# references depends on what configure decided:
+#
+#   USE_INCLUDED_LIBINTL=yes — bash builds its own lib/intl/libintl.a,
+#     which links earlier on the command line and is universal2
+#     because it's built with bash's CFLAGS. CPython's duplicate
+#     -lintl would then be resolved against the system search path
+#     (on Apple Silicon CI, /opt/homebrew/lib isn't on it) and fail,
+#     so drop it and let the bundled copy win.
+#
+#   USE_INCLUDED_LIBINTL=no — the common macOS case. INTL_DEP is
+#     empty, lib/intl/libintl.a is never built, and NOTHING else
+#     provides _libintl_*. Filtering -lintl here is what produced
+#     "ld: symbol(s) not found: _libintl_bindtextdomain ...". So keep
+#     -lintl and supply its search path.
+#
+# CRITICAL constraint on the fallback: Homebrew's libintl is
+# SINGLE-ARCH. The release workflow builds universal2 on a macos-14
+# (arm64) runner via `-arch arm64 -arch x86_64`, so pointing the
+# linker at Homebrew's gettext there would either fail the x86_64
+# slice or silently produce a non-universal binary — and the lipo
+# check right after `make` would reject it. So the fallback is gated
+# on a single-arch build: multi-arch links keep the original
+# filter-and-rely-on-bash's-own-libintl behaviour untouched.
+#
+# The prefix is discovered at make time via brew rather than
+# hardcoded — hardcoding the Intel path is the exact failure the
+# Apple Silicon CI hit. If brew isn't present we add no -L and fall
+# back to the old behaviour rather than inventing a path.
+# Non-empty when 0 or 1 `-arch` flags are in play, i.e. NOT a
+# universal build. Nested ifeq rather than `else ifeq` to stay
+# compatible with the GNU make 3.81 that macOS ships.
+EMBED_ARCH_COUNT := $(words $(filter -arch,$(CFLAGS) $(LDFLAGS) $(LOCAL_LDFLAGS)))
+EMBED_SINGLE_ARCH := $(filter 0 1,$(EMBED_ARCH_COUNT))
+ifeq (@USE_INCLUDED_LIBINTL@,yes)
+# bash bundles its own universal2 libintl.a — drop CPython's duplicate.
+EMBED_INTL_FILTER = -lintl
+EMBED_INTL_LDPATH =
+else
+ifeq ($(strip $(EMBED_SINGLE_ARCH)),)
+# Universal (multi-arch) build, e.g. the release workflow. Homebrew's
+# single-arch libintl must not enter this link — keep the old behaviour.
+EMBED_INTL_FILTER = -lintl
+EMBED_INTL_LDPATH =
+else
+# Single-arch build (the normal local dev case). Nothing else provides
+# _libintl_*, so keep -lintl and give the linker a path to find it.
+# The brew lookup lives inside this branch so it never runs on the
+# universal2 CI path (where its answer would be both unused and wrong).
+GETTEXT_PREFIX := $(shell brew --prefix gettext 2>/dev/null)
+EMBED_INTL_FILTER =
+EMBED_INTL_LDPATH = $(if $(GETTEXT_PREFIX),-L$(GETTEXT_PREFIX)/lib,)
+endif
+endif
+# -L is order-independent for both ld64 and GNU ld, but keep it ahead
+# of the -l flags anyway so the intent reads correctly. Falls back to
+# empty (and a clearer "library 'python3.13' not found" link error)
+# when CPython hasn't been built — run `make -C embedded cpython`.
+EMBED_LIBS := $(EMBED_INTL_LDPATH) $(filter-out $(EMBED_INTL_FILTER),$(shell test -x $(EMBED_PYCFG) && $(EMBED_PYCFG) --ldflags --embed))
 
 STATIC_LD = @STATIC_LD@
 LOCAL_LDFLAGS = @LOCAL_LDFLAGS@

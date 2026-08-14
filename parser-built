@@ -80,29 +80,32 @@ extern int yydebug;
     WORD = 281,                    /* WORD  */
     ASSIGNMENT_WORD = 282,         /* ASSIGNMENT_WORD  */
     REDIR_WORD = 283,              /* REDIR_WORD  */
-    NUMBER = 284,                  /* NUMBER  */
-    ARITH_CMD = 285,               /* ARITH_CMD  */
-    ARITH_FOR_EXPRS = 286,         /* ARITH_FOR_EXPRS  */
-    COND_CMD = 287,                /* COND_CMD  */
-    AND_AND = 288,                 /* AND_AND  */
-    OR_OR = 289,                   /* OR_OR  */
-    GREATER_GREATER = 290,         /* GREATER_GREATER  */
-    LESS_LESS = 291,               /* LESS_LESS  */
-    LESS_AND = 292,                /* LESS_AND  */
-    LESS_LESS_LESS = 293,          /* LESS_LESS_LESS  */
-    GREATER_AND = 294,             /* GREATER_AND  */
-    SEMI_SEMI = 295,               /* SEMI_SEMI  */
-    SEMI_AND = 296,                /* SEMI_AND  */
-    SEMI_SEMI_AND = 297,           /* SEMI_SEMI_AND  */
-    LESS_LESS_MINUS = 298,         /* LESS_LESS_MINUS  */
-    AND_GREATER = 299,             /* AND_GREATER  */
-    AND_GREATER_GREATER = 300,     /* AND_GREATER_GREATER  */
-    LESS_GREATER = 301,            /* LESS_GREATER  */
-    GREATER_BAR = 302,             /* GREATER_BAR  */
-    BAR_AND = 303,                 /* BAR_AND  */
-    DOLPAREN = 304,                /* DOLPAREN  */
-    DOLBRACE = 305,                /* DOLBRACE  */
-    yacc_EOF = 306                 /* yacc_EOF  */
+    AT_DISPATCH = 284,             /* AT_DISPATCH  */
+    ON_DISPATCH = 285,             /* ON_DISPATCH  */
+    ON_INTRO = 286,                /* ON_INTRO  */
+    NUMBER = 287,                  /* NUMBER  */
+    ARITH_CMD = 288,               /* ARITH_CMD  */
+    ARITH_FOR_EXPRS = 289,         /* ARITH_FOR_EXPRS  */
+    COND_CMD = 290,                /* COND_CMD  */
+    AND_AND = 291,                 /* AND_AND  */
+    OR_OR = 292,                   /* OR_OR  */
+    GREATER_GREATER = 293,         /* GREATER_GREATER  */
+    LESS_LESS = 294,               /* LESS_LESS  */
+    LESS_AND = 295,                /* LESS_AND  */
+    LESS_LESS_LESS = 296,          /* LESS_LESS_LESS  */
+    GREATER_AND = 297,             /* GREATER_AND  */
+    SEMI_SEMI = 298,               /* SEMI_SEMI  */
+    SEMI_AND = 299,                /* SEMI_AND  */
+    SEMI_SEMI_AND = 300,           /* SEMI_SEMI_AND  */
+    LESS_LESS_MINUS = 301,         /* LESS_LESS_MINUS  */
+    AND_GREATER = 302,             /* AND_GREATER  */
+    AND_GREATER_GREATER = 303,     /* AND_GREATER_GREATER  */
+    LESS_GREATER = 304,            /* LESS_GREATER  */
+    GREATER_BAR = 305,             /* GREATER_BAR  */
+    BAR_AND = 306,                 /* BAR_AND  */
+    DOLPAREN = 307,                /* DOLPAREN  */
+    DOLBRACE = 308,                /* DOLBRACE  */
+    yacc_EOF = 309                 /* yacc_EOF  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -137,35 +140,38 @@ extern int yydebug;
 #define WORD 281
 #define ASSIGNMENT_WORD 282
 #define REDIR_WORD 283
-#define NUMBER 284
-#define ARITH_CMD 285
-#define ARITH_FOR_EXPRS 286
-#define COND_CMD 287
-#define AND_AND 288
-#define OR_OR 289
-#define GREATER_GREATER 290
-#define LESS_LESS 291
-#define LESS_AND 292
-#define LESS_LESS_LESS 293
-#define GREATER_AND 294
-#define SEMI_SEMI 295
-#define SEMI_AND 296
-#define SEMI_SEMI_AND 297
-#define LESS_LESS_MINUS 298
-#define AND_GREATER 299
-#define AND_GREATER_GREATER 300
-#define LESS_GREATER 301
-#define GREATER_BAR 302
-#define BAR_AND 303
-#define DOLPAREN 304
-#define DOLBRACE 305
-#define yacc_EOF 306
+#define AT_DISPATCH 284
+#define ON_DISPATCH 285
+#define ON_INTRO 286
+#define NUMBER 287
+#define ARITH_CMD 288
+#define ARITH_FOR_EXPRS 289
+#define COND_CMD 290
+#define AND_AND 291
+#define OR_OR 292
+#define GREATER_GREATER 293
+#define LESS_LESS 294
+#define LESS_AND 295
+#define LESS_LESS_LESS 296
+#define GREATER_AND 297
+#define SEMI_SEMI 298
+#define SEMI_AND 299
+#define SEMI_SEMI_AND 300
+#define LESS_LESS_MINUS 301
+#define AND_GREATER 302
+#define AND_GREATER_GREATER 303
+#define LESS_GREATER 304
+#define GREATER_BAR 305
+#define BAR_AND 306
+#define DOLPAREN 307
+#define DOLBRACE 308
+#define yacc_EOF 309
 
 /* Value type.  */
 #if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
 union YYSTYPE
 {
-#line 375 "/usr/local/src/chet/src/bash/src/parse.y"
+#line 401 "./parse.y"
 
   WORD_DESC *word;		/* the word that we read. */
   int number;			/* the number that we read. */
@@ -174,8 +180,11 @@ union YYSTYPE
   REDIRECT *redirect;
   ELEMENT element;
   PATTERN_LIST *pattern;
+#if defined (AGENT_DISPATCH)
+  struct agent_dispatch_tok *agent_dispatch_tok;
+#endif
 
-#line 179 "y.tab.h"
+#line 188 "y.tab.h"
 
 };
 typedef union YYSTYPE YYSTYPE;
