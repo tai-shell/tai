@@ -138,34 +138,19 @@ cpython-clean:
 # helpers. SikuliX itself ships as a jar (see `sikuli-jar` target),
 # not as Python.
 #
-# mcp is PINNED, and the pin is load-bearing — do not relax it to a
-# bare `mcp` without porting the server first. mcp 2.0.0 deleted the
-# entire mcp.server.fastmcp subpackage (verified: zero fastmcp paths
-# in the 2.0.0 wheel), and embedded/runtime/tai_runtime/server.py
-# opens with `from mcp.server.fastmcp import FastMCP`. Because this
-# target installs with --upgrade and carried no constraint, the first
-# CI build after 2.0.0 shipped resolved to it and produced a binary
-# that built and linked fine but died at startup with
-# ModuleNotFoundError, failing the smoke test's tools/list.
-#
-# 1.27.2 is the version verified end-to-end (26 tools registered, real
-# MCP initialize + tools/list roundtrip). Moving to 2.x means porting
-# server.py off FastMCP to the new apps/context surface.
-#
-# The rest of this list is still unpinned and exposed to the same
-# class of silent drift; pinning the full closure is worth doing
-# separately.
-EMBED_DEPS = \
-    mcp==1.27.2 \
-    websockets \
-    pyperclip \
-    pyobjc-framework-Quartz \
-    pyobjc-framework-Vision \
-    pyobjc-framework-Cocoa
+# The full closure — direct AND transitive — is pinned in
+# requirements.txt next to this Makefile. It is not a convenience:
+# these packages are baked into the shipped binary and the install
+# runs with --upgrade, so an unconstrained name means the artifact is
+# built from whatever PyPI serves that day. mcp 2.0.0 deleting
+# mcp.server.fastmcp is the worked example; see requirements.txt for
+# the full rationale, the interaction with the universal2 fuse step,
+# and how to regenerate.
+EMBED_REQS = $(CURDIR)/requirements.txt
 
 deps: $(SITE_PKGS)/.stamp
 
-$(SITE_PKGS)/.stamp:
+$(SITE_PKGS)/.stamp: $(EMBED_REQS)
 	@if [ -z "$(HOST_PYTHON)" ] || ! $(HOST_PYTHON) --version 2>&1 | grep -q 'Python 3\.13\.'; then \
 	    echo "ERROR: HOST_PYTHON must be Python 3.13.x"; \
 	    echo "  current: $(HOST_PYTHON) ($$($(HOST_PYTHON) --version 2>&1 || echo 'not runnable'))"; \
@@ -173,8 +158,17 @@ $(SITE_PKGS)/.stamp:
 	    exit 1; \
 	fi
 	@mkdir -p $(SITE_PKGS)
-	@echo "==> Installing $(EMBED_DEPS) into $(SITE_PKGS)"
-	$(HOST_PYTHON) -m pip install --target $(SITE_PKGS) --upgrade $(EMBED_DEPS)
+	@echo "==> Installing pinned closure from $(EMBED_REQS) into $(SITE_PKGS)"
+	$(HOST_PYTHON) -m pip install --target $(SITE_PKGS) --upgrade -r $(EMBED_REQS)
+	@# Fail loudly here rather than at runtime inside the shipped
+	@# binary: this exact import is what mcp 2.0.0 broke, and the
+	@# resulting binary linked fine and only died on first MCP call.
+	@PYTHONPATH=$(SITE_PKGS) $(HOST_PYTHON) -c \
+	    'from mcp.server.fastmcp import FastMCP' \
+	  || { echo "ERROR: mcp.server.fastmcp not importable after install."; \
+	       echo "  The mcp pin in requirements.txt is load-bearing —"; \
+	       echo "  2.x removed that subpackage. See requirements.txt."; \
+	       exit 1; }
 	@touch $@
 	@echo "==> $$(du -sh $(SITE_PKGS) | cut -f1) installed"
 
