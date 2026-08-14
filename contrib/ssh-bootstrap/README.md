@@ -57,10 +57,29 @@ claude ──► mcp-bridge.py
                    stdio relay                               Terminal.app TCC)
 ```
 
-`tcsh` is single-connection per launch (matches holo `mcp --listen`).
-Each Claude session re-fires `bootstrap.sh` to get a fresh listener
+`tcsh --listen` runs a **serial accept loop**: it serves one session at
+a time (sessions drive singleton resources — the SikuliX JVM, the mouse,
+the keyboard), but the listening socket outlives each session, so a
+client whose connection drops can simply reconnect. It forks per
+session, so each one gets a pristine interpreter and the SikuliX JVM is
+reaped when that session ends. A failed handshake drops that connection
+and keeps listening rather than killing the listener.
+
+This matters because the connection runs over an `ssh -L` tunnel: a
+tunnel hiccup used to be terminal, leaving a wedged `tcsh` on Host B
+that had to be killed by hand before the next session could start.
+
+Each Claude session still re-fires `bootstrap.sh` for a fresh listener
 + fresh token. Re-running `bootstrap.sh` is idempotent: the launcher
-kills any prior tcsh listener before starting a new one.
+kills any prior tcsh listener before starting a new one (it holds the
+port, and its old token wouldn't match anyway).
+
+Because the listener persists, it also relies on the far side noticing
+a dead client. Accepted sockets get TCP keepalive armed (~110s to reap
+a peer that dies without a FIN), but through an `ssh -L` tunnel the
+socket's peer is Host B's own sshd — so set `ClientAliveInterval` in
+Host B's `sshd_config` if you want sshd to tear down forwarded channels
+promptly when the client vanishes.
 
 ## Prereqs
 

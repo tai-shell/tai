@@ -69,8 +69,9 @@ ln -sf /tmp/tai /tmp/tcsh
 printf '%s\n' "$TOKEN" > "$REMOTE_TOKEN_PATH"
 chmod 600 "$REMOTE_TOKEN_PATH"
 
-# Kill any prior listener — single-connection design means the old
-# one is either already gone (client disconnected) or wedged.
+# Kill any prior listener. It persists across sessions (serial accept
+# loop), so it would still hold the port — and it carries a different
+# per-session token, so it could never accept this session anyway.
 pkill -f '^/tmp/tcsh --listen' >/dev/null 2>&1 || true
 
 # Spawn the listener detached. nohup + close-stdin + bg means the
@@ -132,7 +133,7 @@ cat <<EOF
 
 ✓ Bootstrap done.
 
-  Host B listener: 127.0.0.1:$PORT     (single-connection per session)
+  Host B listener: 127.0.0.1:$PORT     (one session at a time; reconnectable)
   Host B token   : $REMOTE_TOKEN_PATH
   Host A token   : $LOCAL_TOKEN_PATH
 
