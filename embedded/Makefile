@@ -137,8 +137,26 @@ cpython-clean:
 # AppleScript app-activation path and holo._macos pixel-capture
 # helpers. SikuliX itself ships as a jar (see `sikuli-jar` target),
 # not as Python.
+#
+# mcp is PINNED, and the pin is load-bearing — do not relax it to a
+# bare `mcp` without porting the server first. mcp 2.0.0 deleted the
+# entire mcp.server.fastmcp subpackage (verified: zero fastmcp paths
+# in the 2.0.0 wheel), and embedded/runtime/tai_runtime/server.py
+# opens with `from mcp.server.fastmcp import FastMCP`. Because this
+# target installs with --upgrade and carried no constraint, the first
+# CI build after 2.0.0 shipped resolved to it and produced a binary
+# that built and linked fine but died at startup with
+# ModuleNotFoundError, failing the smoke test's tools/list.
+#
+# 1.27.2 is the version verified end-to-end (26 tools registered, real
+# MCP initialize + tools/list roundtrip). Moving to 2.x means porting
+# server.py off FastMCP to the new apps/context surface.
+#
+# The rest of this list is still unpinned and exposed to the same
+# class of silent drift; pinning the full closure is worth doing
+# separately.
 EMBED_DEPS = \
-    mcp \
+    mcp==1.27.2 \
     websockets \
     pyperclip \
     pyobjc-framework-Quartz \
