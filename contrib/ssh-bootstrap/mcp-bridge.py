@@ -453,10 +453,37 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
     dead link) because relay() now polls proc.poll() and turns a
     dead tunnel into a non-zero exit — the keepalive is what makes
     that detection actually fire.
+
+    The tunnel MUST NOT be multiplexed — hence ControlPath=none +
+    ControlMaster=no, which override any ControlMaster/ControlPersist
+    the user has in ~/.ssh/config for this host. Multiplexing is a big
+    win for the short _ssh/_scp calls during bootstrap (one auth
+    instead of many) and is actively harmful here, because the -L
+    forward becomes the property of the shared master rather than of
+    this process:
+
+      - The master outlives our session by ControlPersist (commonly
+        minutes), so it keeps holding local PORT after we exit.
+        tunnel.terminate() kills our client, not the master's
+        listener, and the next session cannot bind — locking the user
+        out until ControlPersist expires.
+      - ExitOnForwardFailure stops being a reliable signal. A
+        multiplexed client that cannot establish the forward has been
+        observed exiting 0 with empty stderr, which reads here as
+        "tunnel is fine" and then fails confusingly at connect time.
+      - Worse, the new client may silently inherit the master's STALE
+        forward from a previous session — a forward pointing at a tcsh
+        listener that no longer exists. The tunnel looks healthy and
+        the handshake fails for no visible reason.
+
+    A dedicated connection makes the forward ours: terminate() frees
+    the port immediately, and forward failures are loud.
     """
     proc = subprocess.Popen(
         ["ssh", "-N", "-T",
          *SSH_BASE_OPTS,
+         "-o", "ControlPath=none",
+         "-o", "ControlMaster=no",
          "-o", "ExitOnForwardFailure=yes",
          "-o", "ServerAliveInterval=15",
          "-o", "ServerAliveCountMax=3",
@@ -476,8 +503,18 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
         if rc is None:
             return proc
         err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+        hint = ""
+        if "Address already in use" in err or not err:
+            hint = (
+                f"\nmcp-bridge: local port {port} is probably still held by "
+                f"something else — a previous session's tunnel, another "
+                f"Claude instance using the same port, or a lingering "
+                f"ssh ControlMaster for this host. Check with "
+                f"`lsof -nP -iTCP:{port}` and, if it is a control master, "
+                f"clear it with `ssh -O exit {target}`."
+            )
         die(f"ssh tunnel exited early (rc={rc}): "
-            f"{err or '(no stderr captured)'}")
+            f"{err or '(no stderr captured)'}{hint}")
     proc.kill()
     die(f"ssh tunnel didn't settle within {TUNNEL_READY_TIMEOUT_S}s")
 
