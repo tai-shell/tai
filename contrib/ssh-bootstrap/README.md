@@ -81,6 +81,38 @@ socket's peer is Host B's own sshd — so set `ClientAliveInterval` in
 Host B's `sshd_config` if you want sshd to tear down forwarded channels
 promptly when the client vanishes.
 
+### SSH multiplexing (ControlMaster)
+
+`ControlMaster` / `ControlPersist` in your `~/.ssh/config` for Host B is
+a **good idea** — bootstrap makes several short ssh/scp calls, and
+multiplexing collapses them onto one authentication.
+
+But the bridge's `-L` port-forward deliberately opts **out** of it
+(`ControlPath=none`, `ControlMaster=no` in `open_tunnel`), and that
+override must stay. If the forward is multiplexed it becomes the
+property of the shared master instead of the bridge process, and the
+master outlives the session by `ControlPersist`. Consequences, all
+observed:
+
+* The master keeps holding local `PORT` after the bridge exits.
+  Terminating the bridge kills its own client, not the master's
+  listener, so the *next* session can't bind and you're locked out
+  until `ControlPersist` expires.
+* `ExitOnForwardFailure` stops being trustworthy — a multiplexed client
+  that can't set up the forward has been seen exiting **0 with empty
+  stderr**, which looks like success and then fails at connect time.
+* A new session can silently inherit the master's **stale** forward,
+  pointing at a listener that no longer exists. The tunnel looks
+  healthy; the handshake fails for no visible reason.
+
+If you ever see `ssh tunnel exited early`, check what holds the port:
+
+```sh
+lsof -nP -iTCP:7081
+ssh -O check <host>      # is there a control master?
+ssh -O exit  <host>      # clear it
+```
+
 ## Prereqs
 
 - **Host A**: `tai-bundled-macos-universal2` downloaded somewhere
