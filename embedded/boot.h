@@ -22,11 +22,25 @@
    the desired process exit code. */
 extern int tai_embedded_serve_stdio (void);
 
-/* Same loop, but reachable over a single TCP connection on
-   bind_addr:port. Single-shot: accept one client, run the magic-
-   prefix + optional-token handshake, dup2 the connection over
-   fd 0/1, hand off to tai_embedded_serve_stdio(). When the client
-   disconnects the process exits.
+/* Same loop, but reachable over TCP on bind_addr:port.
+
+   Runs a serial accept-and-fork loop: accept a client, run the
+   magic-prefix + optional-token handshake, fork, and in the child
+   dup2 the connection over fd 0/1 and hand off to
+   tai_embedded_serve_stdio(). The parent waits for that session to
+   end, then loops back to accept the next one — so a dropped
+   connection (ssh tunnel hiccup, client crash) is recoverable by
+   reconnecting instead of requiring the remote process to be killed
+   and re-bootstrapped. Sessions are serial, never concurrent, because
+   they drive singleton resources (SikuliX JVM, mouse, keyboard).
+
+   A failed handshake drops that one connection and keeps listening;
+   it does not terminate the listener. Accepted connections get TCP
+   keepalive armed so a peer that dies without a FIN is eventually
+   reaped rather than blocking a read() forever.
+
+   This function only returns on an unrecoverable error (bind/listen/
+   accept failure); a healthy listener runs until killed.
 
    Used only by `tcsh --listen PORT [--bind ADDR] [--token T]`.
    bind_addr defaults to "127.0.0.1" at the caller. token may be
@@ -39,8 +53,7 @@ extern int tai_embedded_serve_stdio (void);
        … MCP framing continues as if it were stdio …
 
    Returns the same exit code shape as tai_embedded_serve_stdio
-   (70 on infrastructure errors, otherwise the Python loop's
-   return). */
+   (70 on infrastructure errors). */
 extern int tai_embedded_serve_tcp (const char *bind_addr,
 				   int port,
 				   const char *token);

@@ -12,11 +12,14 @@ entire setup transparently:
      Terminal.app on B. The launcher starts a detached
      `tcsh --listen PORT --token T` listener under Terminal.app's
      TCC scope.
-  3. Waits (via SSH pgrep, NOT TCP probe — that would consume the
-     single-connection listener) until tcsh is bound.
+  3. Waits (via a single SSH that polls the listener log remote-side,
+     NOT a TCP probe — a probe would burn a handshake slot) until
+     tcsh is bound.
   4. Opens an SSH `-L PORT:127.0.0.1:PORT` tunnel.
   5. Connects, sends `TAI/1\\n<token>\\n` handshake, waits for `OK\\n`.
-  6. Relays Claude's stdio ↔ socket bidirectionally.
+  6. Relays Claude's stdio ↔ socket bidirectionally, exiting non-zero
+     the moment the socket or the tunnel dies (so Claude Code sees a
+     failed server instead of a silently wedged one).
 
 The user never runs bootstrap.sh — Claude's MCP-server-spawn IS the
 bootstrap. `contrib/ssh-bootstrap/bootstrap.sh` stays around as a
@@ -46,13 +49,13 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import selectors
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -189,12 +192,19 @@ def resolve_binary(spec: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ConnectTimeout bounds the TCP/auth phase. Without it, an asleep or
+# unreachable Host B stalls until the kernel's ~75s TCP timeout — well
+# past our own subprocess timeouts, which then raise an uncaught
+# TimeoutExpired traceback instead of a clean diagnostic.
+SSH_BASE_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+
 def _ssh(target: str, remote_cmd: str, *, timeout: float = 15.0,
          check: bool = False) -> subprocess.CompletedProcess:
     """Run `ssh -o BatchMode=yes target <cmd>` with stdin closed so
     we never accidentally eat the parent's stdin pipe."""
     return subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", target, remote_cmd],
+        ["ssh", *SSH_BASE_OPTS, target, remote_cmd],
         capture_output=True, text=True, timeout=timeout,
         stdin=subprocess.DEVNULL, check=check,
     )
@@ -202,7 +212,7 @@ def _ssh(target: str, remote_cmd: str, *, timeout: float = 15.0,
 
 def _scp(local: str, remote: str, *, timeout: float = 600.0) -> None:
     subprocess.run(
-        ["scp", "-o", "BatchMode=yes", "-q", local, remote],
+        ["scp", *SSH_BASE_OPTS, "-q", local, remote],
         stdin=subprocess.DEVNULL, timeout=timeout, check=True,
     )
 
@@ -280,7 +290,9 @@ def fire_listener(target: str, port: int) -> str:
         printf '%s\\n' '{token}' > {DEFAULT_TOKEN_PATH}
         chmod 600 {DEFAULT_TOKEN_PATH}
 
-        # Kill any prior listener (single-connection design).
+        # Kill any prior listener. It would still be holding the port
+        # (it persists across sessions now), and it was launched with a
+        # different per-session token, so it could never accept us.
         pkill -f '^/tmp/tcsh --listen' >/dev/null 2>&1 || true
 
         # Detached listener — nohup + disown so the Terminal window
@@ -355,8 +367,10 @@ def fire_listener(target: str, port: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — wait for tcsh to bind. Check via SSH pgrep so we don't
-# consume the single-connection listener with a TCP probe.
+# Step 3 — wait for tcsh to bind. Check over SSH rather than by TCP
+# probe: the listener now survives a rejected connection, but a probe
+# still costs a pointless accept/handshake-reject cycle and can race
+# the real connect.
 # ---------------------------------------------------------------------------
 
 
@@ -376,23 +390,39 @@ def wait_for_listener(target: str) -> None:
     The log banner ("tai: tcsh listening on 127.0.0.1:PORT ...")
     is printed by tcsh's C code immediately after listen() returns
     success — so its presence in the log is proof tcsh is ready
-    to accept. Cheap to check via ssh + grep.
+    to accept.
+
+    The poll runs REMOTE-SIDE, inside a single ssh. The previous
+    shape looped locally at 0.3s intervals with a fresh `_ssh` call
+    each pass — up to ~33 full TCP + auth handshakes for one wait,
+    every one of them serial. On a link with any latency that alone
+    could push bootstrap past Claude Code's MCP startup budget
+    (MCP_TIMEOUT, 30s by default), and a burst that size can trip
+    sshd's MaxStartups (default 10:30:100) into randomly refusing
+    connections. One ssh that spins on the remote costs one
+    handshake and returns the moment the banner lands.
     """
     sys.stderr.write("mcp-bridge: waiting for tcsh listener to bind\n")
-    deadline = time.time() + LISTENER_READY_TIMEOUT_S
-    while time.time() < deadline:
-        r = _ssh(
-            target,
-            f"grep -q 'tcsh listening on' {DEFAULT_REMOTE_LOG_PATH} "
-            f"2>/dev/null && echo ready",
-            timeout=5.0,
-        )
-        if r.returncode == 0 and "ready" in r.stdout:
-            return
-        time.sleep(0.3)
+    attempts = max(1, int(LISTENER_READY_TIMEOUT_S / 0.2))
+    remote = (
+        f"i=0; "
+        f"while [ $i -lt {attempts} ]; do "
+        f"  if grep -q 'tcsh listening on' {DEFAULT_REMOTE_LOG_PATH} "
+        f"2>/dev/null; then echo ready; exit 0; fi; "
+        f"  sleep 0.2; i=$((i+1)); "
+        f"done; exit 1"
+    )
+    try:
+        # Generous local timeout: the remote loop enforces the real
+        # deadline, this only catches a wedged ssh.
+        r = _ssh(target, remote, timeout=LISTENER_READY_TIMEOUT_S + 15.0)
+    except subprocess.TimeoutExpired:
+        die("ssh wedged while waiting for the listener to bind")
+    if r.returncode == 0 and "ready" in r.stdout:
+        return
     die(f"listener didn't appear on remote within "
         f"{LISTENER_READY_TIMEOUT_S}s "
-        f"(check /tmp/tai-listener.log on the remote for errors)")
+        f"(check {DEFAULT_REMOTE_LOG_PATH} on the remote for errors)")
 
 
 # ---------------------------------------------------------------------------
@@ -403,22 +433,34 @@ def wait_for_listener(target: str) -> None:
 def open_tunnel(target: str, port: int) -> subprocess.Popen:
     """Open `ssh -L PORT:127.0.0.1:PORT TARGET` and return the Popen.
 
-    Do NOT probe the local forwarded port by opening test TCP
-    connects. Each successful test-connect is forwarded through the
-    tunnel to tcsh's listener — and `tcsh --listen` is single-
-    connection. The probe IS the session: tcsh accepts the test,
-    the probe immediately closes, tcsh reads an empty line, logs
-    'bad magic prefix', and exits. By the time the real handshake-
-    connect runs, tcsh is gone → ConnectionResetError.
+    Still do NOT probe the local forwarded port with test TCP
+    connects. This used to be fatal: `tcsh --listen` accepted exactly
+    one connection, so the probe WAS the session — tcsh accepted it,
+    the probe closed, tcsh logged 'bad magic prefix' and exited, and
+    the real handshake-connect then got ConnectionResetError. The
+    listener now runs a serial accept loop and survives a rejected
+    probe, but probing is still wrong: tcsh serves one session at a
+    time, so a probe that lands first makes the real connect queue in
+    the backlog behind a connection that is about to be rejected.
 
     Instead, trust ExitOnForwardFailure=yes + a short settle. If
     ssh is still alive after settling, the forward is up.
+
+    ServerAliveInterval alone was doing nothing useful: with no
+    explicit ServerAliveCountMax the client waits 3 missed probes
+    at 30s each (~90s) before giving up, and nothing was watching
+    this process anyway. Tightened to 15s x 3 (~45s to notice a
+    dead link) because relay() now polls proc.poll() and turns a
+    dead tunnel into a non-zero exit — the keepalive is what makes
+    that detection actually fire.
     """
     proc = subprocess.Popen(
         ["ssh", "-N", "-T",
+         *SSH_BASE_OPTS,
          "-o", "ExitOnForwardFailure=yes",
-         "-o", "ServerAliveInterval=30",
-         "-o", "BatchMode=yes",
+         "-o", "ServerAliveInterval=15",
+         "-o", "ServerAliveCountMax=3",
+         "-o", "TCPKeepAlive=yes",
          "-L", f"{port}:127.0.0.1:{port}",
          target],
         stdin=subprocess.DEVNULL,
@@ -465,44 +507,104 @@ def handshake(sock: socket.socket, token: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def relay(sock: socket.socket, primer: bytes) -> None:
-    """Foreground stdin pump + one daemon reader.
+def relay(sock: socket.socket, primer: bytes,
+          tunnel: subprocess.Popen) -> int:
+    """Single-threaded select loop over stdin, the socket, and the
+    tunnel's liveness. Returns the process exit code.
 
-    When stdin EOFs, foreground shuts down SHUT_WR (so the server
-    sees EOF on its stdin and finishes its MCP loop), then JOINs
-    the reader so we don't kill it mid-recv before the final
-    responses have drained."""
+    The previous shape was a foreground stdin pump plus a daemon
+    reader thread, and it had a silent-failure hole that is the
+    direct cause of the "MCP call just hangs forever" symptom: when
+    the socket died, the reader thread simply returned. Nothing
+    signalled the foreground, which stayed blocked in
+    sys.stdin.buffer.read1() waiting for a request that, once it
+    arrived, would be written into a dead socket. Claude's in-flight
+    JSON-RPC request got no response AND no error — so instead of
+    seeing a failed MCP server, it sat there until its own client
+    timeout fired.
+
+    Selecting over both directions in one thread makes socket EOF a
+    first-class event we can act on, and a 1s select timeout gives
+    us a place to notice the ssh tunnel exiting. Both now exit
+    non-zero, so Claude Code observes a dead server (and can report
+    or restart it) rather than a black hole.
+
+    Exit code contract:
+        0  clean shutdown — Claude closed stdin, server drained
+        1  tunnel died, or server vanished mid-session
+    """
     if primer:
         sys.stdout.buffer.write(primer)
         sys.stdout.buffer.flush()
 
-    def server_to_stdout() -> None:
-        while True:
-            try:
-                data = sock.recv(4096)
-            except OSError:
-                return
-            if not data:
-                return
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
+    stdin_fd = sys.stdin.buffer.fileno()
+    sel = selectors.DefaultSelector()
+    sel.register(stdin_fd, selectors.EVENT_READ)
+    sel.register(sock, selectors.EVENT_READ)
 
-    reader = threading.Thread(target=server_to_stdout, daemon=True)
-    reader.start()
+    # Once stdin EOFs we're in the drain phase: keep reading responses
+    # until the server closes, but don't wait on it forever.
+    drain_deadline: float | None = None
 
     try:
         while True:
-            data = sys.stdin.buffer.read1(4096)
-            if not data:
-                break
-            sock.sendall(data)
-    finally:
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+            if tunnel.poll() is not None:
+                err = ""
+                if tunnel.stderr is not None:
+                    err = (tunnel.stderr.read() or b"").decode(
+                        errors="replace").strip()
+                sys.stderr.write(
+                    f"mcp-bridge: ssh tunnel died mid-session "
+                    f"(rc={tunnel.returncode}): "
+                    f"{err or '(no stderr captured)'}\n")
+                return 1
 
-    reader.join(timeout=30.0)
+            if drain_deadline is not None and time.time() > drain_deadline:
+                sys.stderr.write(
+                    "mcp-bridge: server didn't close after stdin EOF; "
+                    "exiting anyway\n")
+                return 0
+
+            for key, _ in sel.select(timeout=1.0):
+                if key.fileobj is sock:
+                    try:
+                        data = sock.recv(65536)
+                    except OSError as e:
+                        sys.stderr.write(
+                            f"mcp-bridge: socket error mid-session: {e}\n")
+                        return 1
+                    if not data:
+                        if drain_deadline is not None:
+                            # Expected: server finished after our EOF.
+                            return 0
+                        sys.stderr.write(
+                            "mcp-bridge: remote tai closed the connection "
+                            "mid-session (check "
+                            f"{DEFAULT_REMOTE_LOG_PATH} on the remote)\n")
+                        return 1
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                else:
+                    data = os.read(stdin_fd, 65536)
+                    if not data:
+                        # Claude closed the channel. Half-close so the
+                        # server sees EOF and finishes its MCP loop,
+                        # then drain its final responses.
+                        sel.unregister(stdin_fd)
+                        drain_deadline = time.time() + 30.0
+                        try:
+                            sock.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
+                    try:
+                        sock.sendall(data)
+                    except OSError as e:
+                        sys.stderr.write(
+                            f"mcp-bridge: write to remote failed: {e}\n")
+                        return 1
+    finally:
+        sel.close()
 
 
 # ---------------------------------------------------------------------------
@@ -520,13 +622,16 @@ def cleanup_remote(target: str) -> None:
     but not fatal — leftover bytes on the remote are not worth
     failing the session over.
 
-    The single-connection listener is *supposed* to exit when the
-    client disconnects, but on a SIGTERM/SIGINT exit that teardown
-    races the tunnel close and the listener (plus the SikuliX JVM it
-    spawned) can survive — observed holding /tmp/tcsh and the cache
-    dir open after a CLI exit. So we pkill both before removing files
-    rather than assuming they're already gone. Unix rm wouldn't care
-    about open fds, but a live listener would keep re-touching the
+    The listener is deliberately persistent now — it runs a serial
+    accept loop so a dropped connection is recoverable by reconnecting
+    rather than requiring a fresh bootstrap — so it does NOT exit just
+    because our session ended. Its per-session child does (and reaps
+    the SikuliX JVM via Python's atexit on the way out), but the
+    parent goes back to accept(). Tearing it down is therefore this
+    function's job, not something to assume happened on its own. The
+    pkill pattern matches both parent and child, since fork leaves
+    argv identical. Unix rm wouldn't care about open fds, but a live
+    listener would keep re-touching the
     log and leave a process running on the remote.
 
     Set MCP_BRIDGE_KEEP_TRACES=1 in env to skip cleanup for
@@ -602,14 +707,6 @@ def main() -> None:
     # a local path passes through unchanged.
     tai_binary = resolve_binary(tai_binary)
 
-    # Steps 1–3: ensure the remote is ready.
-    ensure_binary(target, tai_binary)
-    token = fire_listener(target, port)
-    wait_for_listener(target)
-
-    # Step 4: tunnel.
-    tunnel = open_tunnel(target, port)
-
     # Teardown is shared between the signal handler and the `finally`
     # below; the flag makes it run exactly once. The previous handler
     # called os._exit(0) directly, which skipped the `finally` and so
@@ -617,16 +714,31 @@ def main() -> None:
     # with SIGTERM, not a clean stdin EOF, so that was the common path.
     # Result: the remote binary/launcher/token/log + extracted cache and
     # a still-live listener were orphaned on every normal exit.
-    teardown_done = {"yes": False}
+    #
+    # Handlers are installed HERE — before ensure_binary/fire_listener,
+    # i.e. before anything touches the remote — rather than after
+    # open_tunnel as they used to be. That gap was its own orphan
+    # factory: bootstrap can easily outrun Claude Code's MCP startup
+    # budget (MCP_TIMEOUT, 30s by default) on a cold run that ships a
+    # ~191 MB binary, and the SIGTERM Claude sends when it gives up
+    # would land while the handlers were still unset. Python then took
+    # the default SIGTERM disposition — no `finally`, no cleanup — and
+    # the listener fire_listener had just started stayed alive on the
+    # remote. Every timed-out startup leaked one. Covering the whole
+    # remote-touching span costs at most one no-op cleanup ssh in the
+    # case where we're killed before shipping anything.
+    state: dict[str, object] = {"tunnel": None, "done": False}
 
     def teardown() -> None:
-        if teardown_done["yes"]:
+        if state["done"]:
             return
-        teardown_done["yes"] = True
-        try:
-            tunnel.terminate()
-        except Exception:
-            pass
+        state["done"] = True
+        tunnel = state["tunnel"]
+        if tunnel is not None:
+            try:
+                tunnel.terminate()   # type: ignore[union-attr]
+            except Exception:
+                pass
         # Wipe every trace of tai from the remote so leftover bytes can't
         # accumulate across sessions / failed runs.
         cleanup_remote(target)
@@ -638,7 +750,18 @@ def main() -> None:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    rc = 1
     try:
+        # Steps 1–3: ensure the remote is ready.
+        ensure_binary(target, tai_binary)
+        token = fire_listener(target, port)
+        wait_for_listener(target)
+
+        # Step 4: tunnel. Publish it into `state` immediately so a
+        # SIGTERM between here and relay() still tears it down.
+        tunnel = open_tunnel(target, port)
+        state["tunnel"] = tunnel
+
         # Step 5: handshake.
         sock = socket.socket()
         sock.connect(("127.0.0.1", port))
@@ -646,11 +769,13 @@ def main() -> None:
         primer = handshake(sock, token)
         sys.stderr.write("mcp-bridge: ready, relaying MCP\n")
         # Step 6: relay.
-        relay(sock, primer)
+        rc = relay(sock, primer, tunnel)
     finally:
         # Step 7 — runs on clean EOF exit; the signal handler covers the
         # SIGTERM/SIGINT paths. The shared flag prevents a double wipe.
         teardown()
+
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

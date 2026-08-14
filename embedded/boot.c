@@ -16,11 +16,14 @@
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "boot.h"
@@ -413,6 +416,83 @@ _validate_handshake (int fd, const char *expected_token)
   return 0;
 }
 
+/* How long a freshly-accepted client has to complete the
+   "TAI/1\n<token>\n" handshake before we drop it. Without this a
+   client that connects and then says nothing (a port scanner, a
+   half-open TCP from a dying tunnel) blocks the accept loop
+   forever — which, in a serial single-session listener, is a
+   denial of service against the next real reconnect. */
+#define TAI_HANDSHAKE_TIMEOUT_S 10
+
+/* Idle seconds before the kernel starts probing a silent peer, then
+   probe spacing and how many unanswered probes kill the connection.
+   60 + 5*10 => a dead peer is reaped in ~110s instead of macOS's
+   2-hour SO_KEEPALIVE default. */
+#define TAI_KEEPALIVE_IDLE_S  60
+#define TAI_KEEPALIVE_INTVL_S 10
+#define TAI_KEEPALIVE_CNT     5
+
+/* Arm TCP keepalive on an accepted connection.
+
+   This covers the case where the peer dies without ever sending a
+   FIN — the client host panics, is force-slept, or the network
+   partitions — and the socket would otherwise sit in an
+   indefinitely-blocked read(). That is the "listener still running
+   on the remote hours later, must be killed by hand" failure.
+
+   Caveat worth knowing: when reached through an `ssh -L` tunnel the
+   peer of this socket is the local sshd, not the far-end client, so
+   keepalive only fires if sshd itself dies hard. sshd noticing its
+   own dead client (and thus closing this forwarded channel) is
+   governed by ClientAliveInterval in the remote sshd_config. The
+   accept loop below is what makes that recoverable either way.
+
+   All three of these are best-effort: a setsockopt failure means
+   slightly worse dead-peer detection, never a broken session, so
+   the return values are deliberately unchecked. */
+static void
+_tai_arm_keepalive (int fd)
+{
+  int on = 1;
+  setsockopt (fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+
+  /* Darwin spells the idle time TCP_KEEPALIVE (seconds); the
+     INTVL/CNT knobs match Linux's names and exist on 10.9+. */
+#ifdef TCP_KEEPALIVE
+  int idle = TAI_KEEPALIVE_IDLE_S;
+  setsockopt (fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof idle);
+#endif
+#ifdef TCP_KEEPINTVL
+  int intvl = TAI_KEEPALIVE_INTVL_S;
+  setsockopt (fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+#endif
+#ifdef TCP_KEEPCNT
+  int cnt = TAI_KEEPALIVE_CNT;
+  setsockopt (fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+#endif
+
+  /* Writing to a socket the client already closed must return EPIPE,
+     not raise SIGPIPE and take the whole listener down with it. */
+#ifdef SO_NOSIGPIPE
+  setsockopt (fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
+}
+
+/* Set (secs > 0) or clear (secs == 0) a receive timeout on fd.
+
+   Used to bound the handshake read. It MUST be cleared before the
+   fd becomes the session's stdin: a socket carrying SO_RCVTIMEO
+   surfaces expiries as EAGAIN from read(2), which Python raises as
+   an OSError in the middle of the MCP loop. */
+static void
+_tai_set_rcvtimeo (int fd, int secs)
+{
+  struct timeval tv;
+  tv.tv_sec = secs;
+  tv.tv_usec = 0;
+  setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+}
+
 int
 tai_embedded_serve_tcp (const char *bind_addr, int port,
 			const char *token)
@@ -455,7 +535,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
       close (listen_fd);
       return 70;
     }
-  if (listen (listen_fd, 1) < 0)
+  if (listen (listen_fd, 4) < 0)
     {
       fprintf (stderr, "tai: tcsh --listen: listen: %s\n",
 	       strerror (errno));
@@ -465,45 +545,134 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 
   /* Diagnostic only — written to stderr so it doesn't contaminate
      the stdio MCP channel a parent (e.g. an SSH session shovelling
-     bytes to/from a remote nc) might be reading. */
+     bytes to/from a remote nc) might be reading.
+
+     mcp-bridge.py's wait_for_listener greps this line for the
+     literal "tcsh listening on" to know the bind() → listen()
+     chain has completed, so that substring is load-bearing. */
   fprintf (stderr,
-	   "tai: tcsh listening on %s:%d (single connection)%s\n",
+	   "tai: tcsh listening on %s:%d (serial accept loop)%s\n",
 	   bind_addr, port,
 	   token ? " — token required" : "");
+  fflush (stderr);
 
-  int conn_fd = accept (listen_fd, NULL, NULL);
-  if (conn_fd < 0)
-    {
-      fprintf (stderr, "tai: tcsh --listen: accept: %s\n",
-	       strerror (errno));
-      close (listen_fd);
-      return 70;
-    }
-  close (listen_fd);
+  /* Serial accept-and-fork loop.
+     ---------------------------------------------------------------
+     This used to be a single accept() followed by close(listen_fd),
+     which made a dropped connection terminal: the ssh tunnel
+     hiccups, the client goes away, and the only way back was to
+     kill the process on the remote host and re-run the whole
+     bootstrap. Now the listening socket outlives each session, so a
+     reconnecting bridge is simply the next accept().
 
-  if (_validate_handshake (conn_fd, token) != 0)
+     Why fork per session rather than looping back into
+     tai_embedded_serve_stdio() in-process: that function
+     initializes CPython exactly once (the _py_ready guard) and
+     hands off to tai_runtime.server.serve(), which runs FastMCP's
+     stdio transport. That transport builds a fresh TextIOWrapper
+     over sys.stdin.buffer on every run; a second run against a
+     re-dup2'd fd 0 races the first wrapper's finalizer, which
+     closes the buffer it wrapped — i.e. closes our new connection
+     out from under us. Forking sidesteps the entire question: the
+     parent never touches Python, and each session gets a pristine
+     interpreter.
+
+     Serial (waitpid before the next accept) rather than concurrent
+     because a session drives singleton resources — the SikuliX JVM,
+     the mouse, the keyboard, the front window. Two live sessions
+     would fight over them. A second client that connects mid-session
+     simply waits in the backlog. */
+  for (;;)
     {
-      const char *err = "ERR bad handshake\n";
-      (void) write (conn_fd, err, strlen (err));
+      int conn_fd = accept (listen_fd, NULL, NULL);
+      if (conn_fd < 0)
+	{
+	  if (errno == EINTR || errno == ECONNABORTED)
+	    continue;
+	  fprintf (stderr, "tai: tcsh --listen: accept: %s\n",
+		   strerror (errno));
+	  close (listen_fd);
+	  return 70;
+	}
+
+      _tai_arm_keepalive (conn_fd);
+
+      /* Bound the handshake so a silent client can't wedge the loop,
+	 then clear the timeout before the fd becomes stdin. */
+      _tai_set_rcvtimeo (conn_fd, TAI_HANDSHAKE_TIMEOUT_S);
+      int ok = _validate_handshake (conn_fd, token);
+      _tai_set_rcvtimeo (conn_fd, 0);
+
+      if (ok != 0)
+	{
+	  /* A rejected client is no longer fatal: log it, drop that
+	     connection, keep listening. Previously a stray probe
+	     (or one bad token) killed the listener outright. */
+	  const char *err = "ERR bad handshake\n";
+	  (void) write (conn_fd, err, strlen (err));
+	  close (conn_fd);
+	  continue;
+	}
+      (void) write (conn_fd, "OK\n", 3);
+
+      pid_t pid = fork ();
+      if (pid < 0)
+	{
+	  fprintf (stderr, "tai: tcsh --listen: fork: %s\n",
+		   strerror (errno));
+	  close (conn_fd);
+	  continue;
+	}
+
+      if (pid == 0)
+	{
+	  /* Child — this connection's session. */
+	  close (listen_fd);
+
+	  /* dup2 the connection over fd 0 and fd 1. Python's
+	     stdin/stdout are bound during Py_InitializeFromConfig
+	     (called later by tai_embedded_serve_stdio →
+	     tai_embedded_ensure_ready), so this MUST happen first or
+	     the interpreter will grab the original terminal/pipe and
+	     the dup happens too late. */
+	  if (dup2 (conn_fd, 0) < 0 || dup2 (conn_fd, 1) < 0)
+	    {
+	      fprintf (stderr, "tai: tcsh --listen: dup2: %s\n",
+		       strerror (errno));
+	      _exit (70);
+	    }
+	  if (conn_fd > 2)
+	    close (conn_fd);
+
+	  /* exit(), not _exit(): tai_embedded_serve_stdio registers
+	     _tai_finalize_atexit, which drives Python's atexit
+	     handlers — including tai_runtime.server's bridge.stop,
+	     which reaps the SikuliX JVM. Skipping those would leak a
+	     JVM per session. The parent had registered no atexit
+	     handlers at fork time, so running them here is safe. */
+	  exit (tai_embedded_serve_stdio ());
+	}
+
+      /* Parent — hold the listening socket, wait out the session. */
       close (conn_fd);
-      return 70;
-    }
-  (void) write (conn_fd, "OK\n", 3);
 
-  /* dup2 the connection over fd 0 and fd 1. Python's stdin/stdout
-     are bound during Py_InitializeFromConfig (called later by
-     tai_embedded_serve_stdio → tai_embedded_ensure_ready), so this
-     MUST happen first or the interpreter will grab the original
-     terminal/pipe and the dup happens too late. */
-  if (dup2 (conn_fd, 0) < 0 || dup2 (conn_fd, 1) < 0)
-    {
-      fprintf (stderr, "tai: tcsh --listen: dup2: %s\n",
-	       strerror (errno));
-      close (conn_fd);
-      return 70;
-    }
-  if (conn_fd > 2)
-    close (conn_fd);
+      int status = 0;
+      while (waitpid (pid, &status, 0) < 0)
+	{
+	  if (errno != EINTR)
+	    break;
+	}
 
-  return tai_embedded_serve_stdio ();
+      if (WIFSIGNALED (status))
+	fprintf (stderr,
+		 "tai: session %d killed by signal %d; "
+		 "listening for reconnect on %s:%d\n",
+		 (int) pid, WTERMSIG (status), bind_addr, port);
+      else
+	fprintf (stderr,
+		 "tai: session %d ended (exit %d); "
+		 "listening for reconnect on %s:%d\n",
+		 (int) pid, WEXITSTATUS (status), bind_addr, port);
+      fflush (stderr);
+    }
 }
