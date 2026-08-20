@@ -35,10 +35,22 @@ tai_basename (const char *path)
   return base;
 }
 
+/* The control shell (MCP listener, `--listen` support) is reached by
+   invoking the binary under a control-shell name. Two are recognized:
+
+     tcsh — the original name.
+     ksh  — the name the ssh-bootstrap remote deployment now installs
+            under, so the listener process shows up as an ordinary
+            `ksh` on Host B rather than the unusual `tcsh`. Same
+            behaviour; only the name differs.
+
+   Both map to tai_control_shell_main. The user shell keeps the name
+   `tai`; a bare `bash`/`sh` invocation is unmodified upstream bash. */
 int
 tai_is_control_shell_name (const char *argv0)
 {
-  return strcmp (tai_basename (argv0), "tcsh") == 0;
+  const char *base = tai_basename (argv0);
+  return strcmp (base, "tcsh") == 0 || strcmp (base, "ksh") == 0;
 }
 
 int
@@ -73,7 +85,7 @@ tai_control_shell_main (int argc, char **argv)
       if (strcmp (arg, "--help") == 0 || strcmp (arg, "-h") == 0)
 	{
 	  fprintf (stderr,
-		   "Usage: tcsh [--listen PORT [--bind ADDR] [--token T]]\n"
+		   "Usage: ksh [--listen PORT [--bind ADDR] [--token T]]\n"
 		   "\n"
 		   "With no flags: serve MCP over stdio (default).\n"
 		   "With --listen PORT: serve a single TCP connection.\n"
@@ -101,7 +113,7 @@ tai_control_shell_main (int argc, char **argv)
 	  token = argv[++i];
 	  continue;
 	}
-      fprintf (stderr, "tcsh: unknown argument '%s' (try --help)\n", arg);
+      fprintf (stderr, "ksh: unknown argument '%s' (try --help)\n", arg);
       return 64;	/* EX_USAGE */
     }
 

@@ -15,19 +15,19 @@ No external `bootstrap.sh` invocation needed.
 
 | File | Where it runs | What it does |
 |---|---|---|
-| `mcp-bridge.py` | Host A (spawned by Claude) | One-stop: scp binary if sha mismatches, generate + scp launcher.command, `ssh open` it inside Terminal.app, wait for tcsh, open SSH tunnel, handshake, relay stdio. |
-| Generated `launcher.command` | Host B (inside Terminal.app) | Symlinks `/tmp/tai` → `/tmp/tcsh`, writes the per-session token to `/tmp/tai-token`, spawns `tcsh --listen` detached, auto-closes the Terminal window. Generated fresh by `mcp-bridge.py` per session. |
+| `mcp-bridge.py` | Host A (spawned by Claude) | One-stop: scp binary if sha mismatches, generate + scp launcher.command, `ssh open` it inside Terminal.app, wait for the listener, open SSH tunnel, handshake, relay stdio. |
+| Generated `launcher.command` | Host B (inside Terminal.app) | Writes the per-session token to `/tmp/tai-token`, spawns `/tmp/ksh --listen` detached, auto-closes the Terminal window. Generated fresh by `mcp-bridge.py` per session. |
 | `bootstrap.sh` | Host A (optional / debug) | Same setup steps as `mcp-bridge.py` does internally, but as a separate script. Useful for pre-warming a Mac, debugging the chain step by step, or running smoke.sh without Claude. Not required for normal use. |
 | `smoke.sh` | Host A | End-to-end verification (initialize, tools/list, doctor, screen_move). Drives `mcp-bridge.py` with canned JSON-RPC; pass/fail in 30 s. |
 
 ## Why this layout
 
-The naive `claude → ssh hostB tcsh` pattern fails on screen tools:
-sshd is the process that exec'd `tcsh`, so macOS attributes
+The naive `claude → ssh hostB <listener>` pattern fails on screen
+tools: sshd is the process that exec'd it, so macOS attributes
 Accessibility / Screen Recording to **sshd**, which you cannot
 grant. The SikuliX bridge's `Robot.mouseMove()` silently no-ops.
 
-This layout sidesteps that by getting tcsh born inside Terminal.app:
+This layout sidesteps that by getting the listener born inside Terminal.app:
 
 ```
 Host A                                Host B
@@ -40,7 +40,7 @@ bootstrap.sh
                                                        │
                                                        └─ bash (launcher.command)
                                                             │
-                                                            └─ tcsh --listen 7081
+                                                            └─ /tmp/ksh --listen 7081
                                                                (TCC root: Terminal.app ✓)
 
 Later, Claude session:
@@ -52,12 +52,12 @@ claude ──► mcp-bridge.py
                 ├─ ssh: read /tmp/tai-token
                 ├─ ssh -L 7081:127.0.0.1:7081
                 │                     
-                └─ connect 127.0.0.1:7081 ◄─ ssh tunnel ─► tcsh --listen 7081
+                └─ connect 127.0.0.1:7081 ◄─ ssh tunnel ─► /tmp/ksh --listen 7081
                    handshake (TAI/1 + token)                 (still under
                    stdio relay                               Terminal.app TCC)
 ```
 
-`tcsh --listen` runs a **concurrent accept loop**: the listening socket
+`ksh --listen` runs a **concurrent accept loop**: the listening socket
 outlives each session, so a client whose connection drops can simply
 reconnect, *and* a second client can attach while the first is still
 being served. That is what lets two Claude sessions share one host. It forks per
@@ -95,7 +95,7 @@ A failed handshake drops that one connection and keeps the listener
 running, rather than killing it.
 
 All of this matters because the connection runs over an `ssh -L`
-tunnel: a tunnel hiccup used to be terminal, leaving a wedged `tcsh` on
+tunnel: a tunnel hiccup used to be terminal, leaving a wedged listener on
 Host B that had to be killed by hand before the next session could
 start — and a second session used to `pkill` the first one's listener
 out from under it and then die itself on the local port collision.
@@ -147,7 +147,8 @@ ssh -O exit  <host>      # clear it
 ## Prereqs
 
 - **Host A**: `tai-bundled-macos-universal2` downloaded somewhere
-  (v0.1.0a38 or later — needs `tcsh --listen`). By default
+  (v0.1.0a39 or later — needs `--listen`; installs on the remote as
+  `/tmp/ksh`). By default
   `bootstrap.sh` looks at `/usr/local/bin/tai`; override with
   `TAI_BINARY=…`. Python 3 (system default is fine; mcp-bridge.py
   uses stdlib only).
@@ -216,7 +217,7 @@ Claude can now call `screen_move`, `screen_click`, `screen_type`,
 | Var | Default | Notes |
 |---|---|---|
 | `TAI_BINARY` | `/usr/local/bin/tai` | Path to your downloaded tai-bundled binary on A. |
-| `TAI_LISTEN_PORT` | `7081` | Port tcsh binds on B + tunnel local port. |
+| `TAI_LISTEN_PORT` | `7081` | Port the listener binds on B + tunnel local port. |
 | `TAI_REMOTE_TOKEN_PATH` | `/tmp/tai-token` | Where the launcher writes the token on B. |
 | `TAI_LOCAL_TOKEN_PATH` | `/tmp/tai-bridge-token` | Local copy on A. mcp-bridge.py doesn't use this (it re-fetches from B) — it's kept for operator inspection. |
 
@@ -244,7 +245,7 @@ optional and typically set in Claude's spawn config):
 
 - **Single connection per launch.** Mirrors `holo mcp --listen`. The
   Claude session, the JVM bridge state, and the TCC chain are all
-  per-tcsh-process. Multi-connection means concurrent JVM bridges
+  per-listener-process. Multi-connection means concurrent JVM bridges
   competing for the SikuliX state, which is messy. Re-fire
   `bootstrap.sh` to get a fresh listener; cheap (~2 s).
 - **Token over SSH, not env / CLI.** Tokens passed via env vars

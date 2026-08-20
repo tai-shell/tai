@@ -21,7 +21,7 @@
 #
 # Prereqs:
 #     - SSH key-based auth to Host B (no password prompts).
-#     - tai v0.1.0a38+ at TAI_BINARY (needs `tcsh --listen`).
+#     - tai v0.1.0a39+ at TAI_BINARY (needs `--listen`; installs as ksh).
 #     - On Host B: Java installed; Terminal.app granted Accessibility
 #       + Screen Recording (verifiable with `doctor`).
 
@@ -65,14 +65,16 @@ PORT='__PORT__'
 TOKEN='__TOKEN__'
 REMOTE_TOKEN_PATH='__REMOTE_TOKEN_PATH__'
 
-ln -sf /tmp/tai /tmp/tcsh
+# The binary is installed and invoked directly as /tmp/ksh; its
+# basename `ksh` is a control-shell name, so it serves MCP. No symlink,
+# no separate `tai` file — one innocuously named file on the remote.
 printf '%s\n' "$TOKEN" > "$REMOTE_TOKEN_PATH"
 chmod 600 "$REMOTE_TOKEN_PATH"
 
 # Kill any prior listener. It persists across sessions (serial accept
 # loop), so it would still hold the port — and it carries a different
 # per-session token, so it could never accept this session anyway.
-pkill -f '^/tmp/tcsh --listen' >/dev/null 2>&1 || true
+pkill -f '^/tmp/ksh --listen' >/dev/null 2>&1 || true
 
 # Spawn the listener detached. nohup + close-stdin + bg means the
 # Terminal window can close while the listener keeps running. TCC
@@ -80,7 +82,7 @@ pkill -f '^/tmp/tcsh --listen' >/dev/null 2>&1 || true
 # after the parent shell exits (orphan → reparented to launchd,
 # but TCC responsibility is sticky).
 LOG=/tmp/tai-listener.log
-nohup /tmp/tcsh --listen "$PORT" --token "$TOKEN" \
+nohup /tmp/ksh --listen "$PORT" --token "$TOKEN" \
     < /dev/null > "$LOG" 2>&1 &
 disown
 
@@ -109,16 +111,16 @@ sed -i.bak \
 rm -f "${LAUNCHER}.bak"
 chmod +x "$LAUNCHER"
 
-echo ">>> Shipping tai binary ($(du -h "$BINARY" | cut -f1)) → $TARGET:/tmp/tai"
-scp -q "$BINARY" "$TARGET":/tmp/tai
+echo ">>> Shipping binary ($(du -h "$BINARY" | cut -f1)) → $TARGET:/tmp/ksh"
+scp -q "$BINARY" "$TARGET":/tmp/ksh
 
 echo ">>> Shipping launcher → $TARGET:/tmp/launcher.command"
 scp -q "$LAUNCHER" "$TARGET":/tmp/launcher.command
 
 echo ">>> Setting exec bits + clearing quarantine on $TARGET"
 ssh "$TARGET" \
-    'chmod +x /tmp/tai /tmp/launcher.command && \
-     xattr -d com.apple.quarantine /tmp/tai 2>/dev/null || true'
+    'chmod +x /tmp/ksh /tmp/launcher.command && \
+     xattr -d com.apple.quarantine /tmp/ksh 2>/dev/null || true'
 
 echo ">>> Firing launcher inside Terminal.app on $TARGET (open via Launch Services)"
 ssh "$TARGET" 'open /tmp/launcher.command'
