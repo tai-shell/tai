@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import atexit
 import base64
+import contextlib
+import functools
 import os
 import sys
 import threading
+import time
 from typing import Any
 
 
@@ -91,6 +94,156 @@ _bridge: BridgeClient | None = None
 _templates: TemplateStore | None = None
 _bridge_lock = threading.Lock()
 _templates_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Desktop lock — arbitrates the one physical screen between sessions.
+#
+# `tcsh --listen` now serves sessions CONCURRENTLY (it forks per
+# connection and no longer waits one out before accepting the next), so
+# two Claude sessions can be attached to the same host at the same time.
+# The transport handles that fine. The desktop does not: there is one
+# mouse, one keyboard, and one front window, and a meaningful unit of
+# work is a sequence — activate, then click, then type — not a single
+# call. Interleaving two of those sequences corrupts both.
+#
+# So mutating tools take an exclusive lock and read-only ones don't.
+# That keeps screenshots, tab listings, and doctor cheap and parallel
+# while serialising anything that actually moves the pointer or types.
+#
+# The lock MUST be inter-process. Each session is a separate forked
+# process with its own interpreter, so a threading.Lock would be
+# invisible across sessions and arbitrate nothing. fcntl.flock on a
+# shared path is visible to every process on the host and, importantly,
+# is released automatically by the kernel if a session dies or is
+# killed — no stale lock to clean up by hand.
+#
+# Two layers, because both hazards are real:
+#   * flock          — between sessions (separate processes)
+#   * _desktop_rlock — between threads inside one session, since FastMCP
+#                      can dispatch tools from a worker pool. flock is
+#                      per open-file-description, so it would NOT stop
+#                      two threads in the same process from both
+#                      proceeding.
+# A thread-local depth counter makes re-entry safe, so a locked tool
+# calling another locked tool cannot deadlock against itself.
+# ---------------------------------------------------------------------------
+
+DESKTOP_LOCK_PATH = "/tmp/tai-desktop.lock"
+DEFAULT_DESKTOP_LOCK_TIMEOUT_S = 60.0
+
+_desktop_rlock = threading.RLock()
+_desktop_tls = threading.local()
+_desktop_fd: int | None = None
+_desktop_fd_guard = threading.Lock()
+
+
+def _desktop_lock_timeout() -> float:
+    """Seconds to wait for the desktop before giving up. Keep this
+    below the MCP client's per-tool timeout so the caller gets our
+    explanatory error rather than a generic client-side timeout."""
+    raw = os.environ.get("TAI_DESKTOP_LOCK_TIMEOUT")
+    if not raw:
+        return DEFAULT_DESKTOP_LOCK_TIMEOUT_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_DESKTOP_LOCK_TIMEOUT_S
+
+
+def _desktop_fd_open() -> int:
+    global _desktop_fd
+    with _desktop_fd_guard:
+        if _desktop_fd is None:
+            _desktop_fd = os.open(
+                DESKTOP_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600
+            )
+        return _desktop_fd
+
+
+def _desktop_holder() -> str:
+    """Best-effort description of who holds the lock, for error text."""
+    try:
+        with open(DESKTOP_LOCK_PATH) as f:
+            note = f.read().strip()
+        return note or "another session"
+    except OSError:
+        return "another session"
+
+
+@contextlib.contextmanager
+def _desktop(tool: str):
+    """Hold the desktop for the duration of one mutating tool call."""
+    import fcntl
+
+    depth = getattr(_desktop_tls, "depth", 0)
+    if depth:
+        # Re-entrant call on a thread that already owns the desktop.
+        _desktop_tls.depth = depth + 1
+        try:
+            yield
+        finally:
+            _desktop_tls.depth -= 1
+        return
+
+    timeout = _desktop_lock_timeout()
+    deadline = time.monotonic() + timeout
+
+    if not _desktop_rlock.acquire(timeout=timeout if timeout else -1):
+        raise RuntimeError(
+            f"{tool}: another tool call in this session is driving the "
+            f"desktop and did not finish within {timeout:g}s"
+        )
+    try:
+        fd = _desktop_fd_open()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"{tool}: the desktop is held by {_desktop_holder()} "
+                        f"and did not become free within {timeout:g}s. Two "
+                        f"sessions are attached to this host; mutating tools "
+                        f"run one at a time so they don't type into each "
+                        f"other's windows. Retry, or let the other session "
+                        f"finish. Raise TAI_DESKTOP_LOCK_TIMEOUT to wait "
+                        f"longer."
+                    ) from None
+                time.sleep(0.1)
+
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, f"pid {os.getpid()} running {tool}\n".encode())
+        except OSError:
+            pass  # Diagnostic only — never fail a call over the note.
+
+        _desktop_tls.depth = 1
+        try:
+            yield
+        finally:
+            _desktop_tls.depth = 0
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        _desktop_rlock.release()
+
+
+def _serialized(fn):
+    """Mark a tool as desktop-mutating: it runs under the exclusive
+    lock. Applied UNDER @_app.tool() so FastMCP registers the wrapper;
+    functools.wraps keeps __wrapped__/__annotations__ intact so
+    inspect.signature still resolves the real parameters and the
+    generated tool schema is unchanged."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _desktop(fn.__name__):
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _get_bridge() -> BridgeClient:
@@ -182,24 +335,28 @@ def _get_templates() -> TemplateStore:
 
 
 @_app.tool()
+@_serialized
 def browser_navigate(url: str) -> dict[str, Any]:
     """Navigate the active Chrome tab to a URL."""
     return browser_chrome.navigate(url)
 
 
 @_app.tool()
+@_serialized
 def browser_new_tab(url: str | None = None) -> dict[str, Any]:
     """Open a new Chrome tab, optionally navigated to URL."""
     return browser_chrome.new_tab(url)
 
 
 @_app.tool()
+@_serialized
 def browser_close_active_tab() -> dict[str, Any]:
     """Close the active Chrome tab."""
     return browser_chrome.close_active_tab()
 
 
 @_app.tool()
+@_serialized
 def browser_activate_tab(index: int) -> dict[str, Any]:
     """Activate the Chrome tab at the given 1-based index in the front window."""
     return browser_chrome.activate_tab(index)
@@ -224,24 +381,28 @@ def browser_read_active_title() -> dict[str, Any]:
 
 
 @_app.tool()
+@_serialized
 def browser_reload() -> dict[str, Any]:
     """Reload the active Chrome tab."""
     return browser_chrome.reload()
 
 
 @_app.tool()
+@_serialized
 def browser_back() -> dict[str, Any]:
     """Navigate the active Chrome tab back in history."""
     return browser_chrome.go_back()
 
 
 @_app.tool()
+@_serialized
 def browser_forward() -> dict[str, Any]:
     """Navigate the active Chrome tab forward in history."""
     return browser_chrome.go_forward()
 
 
 @_app.tool()
+@_serialized
 def browser_execute_js(js: str) -> dict[str, Any]:
     """Run a JS snippet in the active Chrome tab via Apple Events.
 
@@ -261,12 +422,14 @@ def browser_execute_js(js: str) -> dict[str, Any]:
 
 
 @_app.tool()
+@_serialized
 def app_activate(name: str) -> dict[str, Any]:
     """Bring the named application to the foreground (e.g. "Google Chrome")."""
     return _get_bridge().activate(name)
 
 
 @_app.tool()
+@_serialized
 def screen_click(
     x: int, y: int, modifiers: list[str] | None = None
 ) -> dict[str, Any]:
@@ -275,24 +438,28 @@ def screen_click(
 
 
 @_app.tool()
+@_serialized
 def screen_move(x: int, y: int) -> dict[str, Any]:
     """Move the cursor to (x, y). No click, no scroll, no key."""
     return _get_bridge().mouse_move(x, y)
 
 
 @_app.tool()
+@_serialized
 def screen_type(text: str) -> dict[str, Any]:
     """Type a literal string into whatever has keyboard focus."""
     return _get_bridge().type_text(text)
 
 
 @_app.tool()
+@_serialized
 def screen_key(combo: str) -> dict[str, Any]:
     """Send a key combo. Examples: "cmd+v", "enter", "shift+tab"."""
     return _get_bridge().key(combo)
 
 
 @_app.tool()
+@_serialized
 def screen_scroll(
     x: int, y: int, direction: str = "down", steps: int = 3
 ) -> dict[str, Any]:
@@ -326,6 +493,7 @@ def screen_find_image(
 
 
 @_app.tool()
+@_serialized
 def screen_user_capture(
     prompt: str = "", timeout: float = 60.0
 ) -> dict[str, Any]:
@@ -760,6 +928,7 @@ def _summarize(result: dict[str, Any]) -> list[str]:
         "{cancelled: true} if the user pressed Esc."
     )
 )
+@_serialized
 def ui_template_capture(
     label: str,
     app: str | None = None,
@@ -836,6 +1005,7 @@ def ui_template_find(
         "advertise params we silently discard. Raises if nothing matches."
     )
 )
+@_serialized
 def ui_template_click(
     label: str,
     app: str | None = None,

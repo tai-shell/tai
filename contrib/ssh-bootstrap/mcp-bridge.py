@@ -430,7 +430,106 @@ def wait_for_listener(target: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def open_tunnel(target: str, port: int) -> subprocess.Popen:
+def probe_remote_session(target: str, port: int) -> tuple[str, str | None]:
+    """Classify what is already running on this host/port.
+
+    Returns one of:
+        ("none",   None)    nothing live — do a normal bootstrap
+        ("attach", token)   a concurrent-capable listener we can join
+        ("legacy", None)    a listener too old to accept a 2nd session
+
+    "Attachable" needs three things together: a
+    `/tmp/tcsh --listen <port>` process, a readable token, and a bind
+    banner saying the listener serves sessions concurrently. A listener
+    without a token (mid-launch, or a cleanup that raced) counts as
+    absent so we fall back to bootstrapping.
+
+    The banner check is a version guard, and it matters: listeners
+    before this change accepted one connection at a time and only
+    accepted the next after the first disconnected. Attaching to one of
+    those would not fail — it would silently hang in the backlog until
+    the other session ended, blowing the MCP startup timeout with no
+    explanation. Better to detect it and say so.
+
+    The token is deliberately shared rather than rotated: the running
+    listener validates against the token it was started with, so an
+    attaching session has no way to introduce a new one. That is why
+    attach mode must never re-fire the launcher.
+    """
+    if os.environ.get("TAI_BRIDGE_ATTACH") == "never":
+        return ("none", None)
+    r = _ssh(
+        target,
+        f"pgrep -f '^{DEFAULT_REMOTE_TCSH_LINK} --listen {port}' "
+        f">/dev/null 2>&1 || exit 9; "
+        f"cat {DEFAULT_TOKEN_PATH} 2>/dev/null; "
+        f"echo '---'; "
+        f"grep -o 'tcsh listening on[^\\n]*' {DEFAULT_REMOTE_LOG_PATH} "
+        f"2>/dev/null | tail -1",
+        timeout=20.0,
+    )
+    if r.returncode != 0:
+        return ("none", None)
+    token, _, banner = (r.stdout or "").partition("---")
+    token = token.strip()
+    if len(token) != 64:
+        return ("none", None)
+    if "concurrent sessions" not in banner:
+        return ("legacy", None)
+    return ("attach", token)
+
+
+def count_remote_sessions(target: str, port: int) -> int:
+    """How many sessions are currently connected to the listener.
+
+    Counts forked children of the accept loop: the parent matches
+    `--listen <port>` and so does every child (fork leaves argv
+    identical), so subtract the one parent. Returns -1 when we can't
+    tell, which callers treat as "assume others exist" — the safe
+    direction, since the alternative is wiping a host out from under a
+    live session.
+    """
+    r = _ssh(
+        target,
+        f"pgrep -f '^{DEFAULT_REMOTE_TCSH_LINK} --listen {port}' | wc -l",
+        timeout=20.0,
+    )
+    if r.returncode != 0:
+        return -1
+    try:
+        n = int((r.stdout or "").strip())
+    except ValueError:
+        return -1
+    return max(0, n - 1)
+
+
+def pick_local_port(preferred: int) -> int:
+    """Local end of the tunnel: `preferred` when free, else an
+    ephemeral port.
+
+    The local port only has to match the remote one by convention, and
+    insisting on it is what made a second session fail outright — the
+    first session's tunnel already holds it, so `-L` could not bind.
+    Falling back to an ephemeral port lets sessions coexist. The remote
+    port is unchanged; only our end of the forward moves.
+    """
+    for candidate in (preferred, 0):
+        s = socket.socket()
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", candidate))
+            chosen = s.getsockname()[1]
+            return chosen
+        except OSError:
+            continue
+        finally:
+            s.close()
+    die("could not find a free local port for the tunnel")
+    return 0  # unreachable; keeps type checkers happy
+
+
+def open_tunnel(target: str, port: int,
+                local_port: int | None = None) -> subprocess.Popen:
     """Open `ssh -L PORT:127.0.0.1:PORT TARGET` and return the Popen.
 
     Still do NOT probe the local forwarded port with test TCP
@@ -488,7 +587,7 @@ def open_tunnel(target: str, port: int) -> subprocess.Popen:
          "-o", "ServerAliveInterval=15",
          "-o", "ServerAliveCountMax=3",
          "-o", "TCPKeepAlive=yes",
-         "-L", f"{port}:127.0.0.1:{port}",
+         "-L", f"{local_port or port}:127.0.0.1:{port}",
          target],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -764,7 +863,13 @@ def main() -> None:
     # remote. Every timed-out startup leaked one. Covering the whole
     # remote-touching span costs at most one no-op cleanup ssh in the
     # case where we're killed before shipping anything.
-    state: dict[str, object] = {"tunnel": None, "done": False}
+    # own_remote gates every destructive action in teardown. It is True
+    # only once we commit to bootstrapping — i.e. once we may have put
+    # a binary or a listener on the host. Attached sessions and
+    # refused-to-attach sessions never set it, so they can't wipe a
+    # remote that belongs to someone else.
+    state: dict[str, object] = {"tunnel": None, "done": False,
+                                "own_remote": False}
 
     def teardown() -> None:
         if state["done"]:
@@ -776,6 +881,36 @@ def main() -> None:
                 tunnel.terminate()   # type: ignore[union-attr]
             except Exception:
                 pass
+
+        # We only clean up a remote we actually set up. That covers two
+        # cases, and getting it wrong is destructive in both:
+        #   * an ATTACHED session didn't ship the binary, didn't start
+        #     the listener, and doesn't own the token — wiping would
+        #     tear the host out from under the session that does;
+        #   * a session that REFUSED to attach (listener too old)
+        #     explicitly decided not to disturb what's running, so it
+        #     must not then delete it on the way out.
+        # Closing our tunnel is the whole of our cleanup; the listener
+        # drops our forked child on EOF.
+        if not state["own_remote"]:
+            sys.stderr.write(
+                "mcp-bridge: this remote isn't ours — leaving it alone\n")
+            return
+
+        # Owner path. Still don't wipe if someone else is attached:
+        # cleanup_remote pkills the listener, which would kill THEIR
+        # session's child too, and removes the binary they're running.
+        # Give our own child a moment to exit first so we don't count
+        # ourselves.
+        time.sleep(0.5)
+        others = count_remote_sessions(target, port)
+        if others != 0:
+            sys.stderr.write(
+                f"mcp-bridge: leaving listener up — "
+                f"{'other sessions still attached' if others > 0 else 'could not confirm no other sessions'}"
+                f"; not wiping the remote\n")
+            return
+
         # Wipe every trace of tai from the remote so leftover bytes can't
         # accumulate across sessions / failed runs.
         cleanup_remote(target)
@@ -789,19 +924,66 @@ def main() -> None:
 
     rc = 1
     try:
-        # Steps 1–3: ensure the remote is ready.
-        ensure_binary(target, tai_binary)
-        token = fire_listener(target, port)
-        wait_for_listener(target)
+        # Step 1 — attach or bootstrap?
+        #
+        # Attaching is what lets a second Claude session use a host that
+        # already has one. Before this, session 2 unconditionally
+        # re-fired the launcher, whose `pkill` killed session 1's
+        # listener AND its forked child — so session 2 destroyed
+        # session 1 and then died itself on the local port collision.
+        mode, existing = probe_remote_session(target, port)
+        if mode == "attach":
+            token = existing or ""
+            sys.stderr.write(
+                "mcp-bridge: existing listener found — attaching to it "
+                "(not re-bootstrapping)\n")
+        elif mode == "legacy":
+            # Refuse rather than pick one of two bad options: attaching
+            # would hang in the backlog until the other session ended,
+            # and bootstrapping would pkill a listener someone is
+            # actively using.
+            die(
+                f"a listener is already running on {target}:{port}, but it "
+                f"predates concurrent-session support, so a second session "
+                f"cannot attach to it.\n"
+                f"mcp-bridge: let the other session finish, or set "
+                f"TAI_BRIDGE_ATTACH=never to force a fresh bootstrap "
+                f"(which WILL terminate that session)."
+            )
+        elif os.environ.get("TAI_BRIDGE_ATTACH") == "only":
+            die("TAI_BRIDGE_ATTACH=only but no live listener was found on "
+                f"{target}:{port}")
+        else:
+            # Steps 1–3: ensure the remote is ready. Only the owning
+            # session ships the binary; overwriting /tmp/tai while
+            # another session is executing it would be a bad idea
+            # regardless of what scp thinks about it.
+            #
+            # Claim ownership BEFORE touching anything, so a SIGTERM
+            # partway through bootstrap still cleans up what we
+            # started — that was the whole point of hoisting the signal
+            # handlers above this block.
+            state["own_remote"] = True
+            ensure_binary(target, tai_binary)
+            token = fire_listener(target, port)
+            wait_for_listener(target)
 
-        # Step 4: tunnel. Publish it into `state` immediately so a
-        # SIGTERM between here and relay() still tears it down.
-        tunnel = open_tunnel(target, port)
+        # Step 4: tunnel. The local end falls back to an ephemeral port
+        # when the conventional one is taken (i.e. another session's
+        # tunnel already holds it); the remote end is always `port`.
+        local_port = pick_local_port(port)
+        if local_port != port:
+            sys.stderr.write(
+                f"mcp-bridge: local port {port} busy, forwarding "
+                f"{local_port} → {target}:{port}\n")
+        # Publish into `state` immediately so a SIGTERM between here and
+        # relay() still tears the tunnel down.
+        tunnel = open_tunnel(target, port, local_port=local_port)
         state["tunnel"] = tunnel
 
         # Step 5: handshake.
         sock = socket.socket()
-        sock.connect(("127.0.0.1", port))
+        sock.connect(("127.0.0.1", local_port))
         sys.stderr.write("mcp-bridge: handshake (TAI/1 + token)\n")
         primer = handshake(sock, token)
         sys.stderr.write("mcp-bridge: ready, relaying MCP\n")

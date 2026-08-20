@@ -17,6 +17,7 @@
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -551,7 +552,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
      literal "tcsh listening on" to know the bind() → listen()
      chain has completed, so that substring is load-bearing. */
   fprintf (stderr,
-	   "tai: tcsh listening on %s:%d (serial accept loop)%s\n",
+	   "tai: tcsh listening on %s:%d (concurrent sessions)%s\n",
 	   bind_addr, port,
 	   token ? " — token required" : "");
   fflush (stderr);
@@ -577,11 +578,32 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
      parent never touches Python, and each session gets a pristine
      interpreter.
 
-     Serial (waitpid before the next accept) rather than concurrent
-     because a session drives singleton resources — the SikuliX JVM,
-     the mouse, the keyboard, the front window. Two live sessions
-     would fight over them. A second client that connects mid-session
-     simply waits in the backlog. */
+     Sessions run CONCURRENTLY: the parent goes straight back to
+     accept() instead of waiting out each child. That lets a second
+     Claude session attach to a listener that is already serving one,
+     which is the whole point of the bridge's attach mode — before
+     this, a second connection sat in the backlog until the first
+     disconnected, so its MCP initialize blocked and the client timed
+     out.
+
+     Concurrency at the transport layer does NOT mean the desktop is
+     safe to drive from two sessions at once. It isn't: the mouse,
+     keyboard, and front window are singletons, and a meaningful unit
+     of work is a sequence (activate → click → type), not one call.
+     That arbitration lives one layer up, in tai_runtime.server's
+     desktop lock, which serializes mutating tools across sessions.
+     It has to be an inter-process lock precisely because each session
+     is a separate forked process, not a thread.
+
+     Children are reaped by setting SIGCHLD to SIG_IGN in the parent
+     (POSIX: no zombies). The child MUST restore SIG_DFL before it
+     touches Python — subprocess.Popen.wait() needs to be able to
+     waitpid its own children, and with SIGCHLD ignored they are
+     auto-reaped out from under it (waitpid returns ECHILD). That
+     would break holo.bridge's SikuliX JVM. */
+  signal (SIGCHLD, SIG_IGN);
+
+  unsigned long sessions_started = 0;
   for (;;)
     {
       int conn_fd = accept (listen_fd, NULL, NULL);
@@ -629,6 +651,13 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 	  /* Child — this connection's session. */
 	  close (listen_fd);
 
+	  /* Undo the parent's SIGCHLD=SIG_IGN before any Python runs.
+	     Ignored SIGCHLD is inherited across fork, and it makes the
+	     kernel auto-reap our own children — so subprocess.Popen's
+	     waitpid() would fail with ECHILD and holo.bridge could not
+	     manage the SikuliX JVM it spawns. */
+	  signal (SIGCHLD, SIG_DFL);
+
 	  /* dup2 the connection over fd 0 and fd 1. Python's
 	     stdin/stdout are bound during Py_InitializeFromConfig
 	     (called later by tai_embedded_serve_stdio →
@@ -653,26 +682,22 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 	  exit (tai_embedded_serve_stdio ());
 	}
 
-      /* Parent — hold the listening socket, wait out the session. */
+      /* Parent — the child owns this connection now. Drop our copy
+	 and go straight back to accept() so another session can attach
+	 while this one runs. No waitpid: SIGCHLD is SIG_IGN, so the
+	 kernel reaps children for us and none of them linger as
+	 zombies. */
       close (conn_fd);
 
-      int status = 0;
-      while (waitpid (pid, &status, 0) < 0)
-	{
-	  if (errno != EINTR)
-	    break;
-	}
-
-      if (WIFSIGNALED (status))
-	fprintf (stderr,
-		 "tai: session %d killed by signal %d; "
-		 "listening for reconnect on %s:%d\n",
-		 (int) pid, WTERMSIG (status), bind_addr, port);
-      else
-	fprintf (stderr,
-		 "tai: session %d ended (exit %d); "
-		 "listening for reconnect on %s:%d\n",
-		 (int) pid, WEXITSTATUS (status), bind_addr, port);
+      /* Monotonic count of sessions started, not a live count: with
+	 SIGCHLD ignored we get no exit notification, so anything
+	 claiming to be "currently live" here would drift. Use
+	 `pgrep -f "tcsh --listen"` on the host for the real picture. */
+      sessions_started++;
+      fprintf (stderr,
+	       "tai: session %d started (#%lu since boot); still "
+	       "accepting on %s:%d\n",
+	       (int) pid, sessions_started, bind_addr, port);
       fflush (stderr);
     }
 }
