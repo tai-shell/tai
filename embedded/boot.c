@@ -32,7 +32,7 @@
 #include "payload.h"
 
 /* Locate the directory containing the running binary, resolving any
-   symlinks (so /tmp/tcsh -> /usr/local/bin/tai gives /usr/local/bin).
+   symlinks (so a symlink to the real binary resolves to its dir).
    On success returns 0 and writes the directory into `out` (which
    must have room for PATH_MAX bytes). Returns -1 on failure. */
 static int
@@ -357,7 +357,7 @@ tai_embedded_serve_stdio (void)
   return (int) exit_code;
 }
 
-/* ----------- --listen support (TCP transport for tcsh) ------------ */
+/* --------- --listen support (TCP transport, control shell) -------- */
 
 /* Read a single newline-terminated line into `buf`. Caps at `max - 1`
    bytes (always leaves room for a trailing NUL). Returns the number
@@ -396,7 +396,7 @@ _validate_handshake (int fd, const char *expected_token)
   ssize_t n = _read_line (fd, buf, sizeof buf);
   if (n < 0 || strcmp (buf, "TAI/1") != 0)
     {
-      fprintf (stderr, "tai: tcsh --listen: bad magic prefix\n");
+      fprintf (stderr, "tai: ksh --listen: bad magic prefix\n");
       return -1;
     }
 
@@ -405,12 +405,12 @@ _validate_handshake (int fd, const char *expected_token)
       n = _read_line (fd, buf, sizeof buf);
       if (n < 0)
 	{
-	  fprintf (stderr, "tai: tcsh --listen: missing token line\n");
+	  fprintf (stderr, "tai: ksh --listen: missing token line\n");
 	  return -1;
 	}
       if (strcmp (buf, expected_token) != 0)
 	{
-	  fprintf (stderr, "tai: tcsh --listen: token mismatch\n");
+	  fprintf (stderr, "tai: ksh --listen: token mismatch\n");
 	  return -1;
 	}
     }
@@ -500,7 +500,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 {
   if (port <= 0 || port > 65535)
     {
-      fprintf (stderr, "tai: tcsh --listen: invalid port %d\n", port);
+      fprintf (stderr, "tai: ksh --listen: invalid port %d\n", port);
       return 70;
     }
   if (bind_addr == NULL)
@@ -509,7 +509,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
   int listen_fd = socket (AF_INET, SOCK_STREAM, 0);
   if (listen_fd < 0)
     {
-      fprintf (stderr, "tai: tcsh --listen: socket: %s\n",
+      fprintf (stderr, "tai: ksh --listen: socket: %s\n",
 	       strerror (errno));
       return 70;
     }
@@ -523,7 +523,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
   addr.sin_port = htons ((uint16_t) port);
   if (inet_pton (AF_INET, bind_addr, &addr.sin_addr) != 1)
     {
-      fprintf (stderr, "tai: tcsh --listen: invalid bind address %s\n",
+      fprintf (stderr, "tai: ksh --listen: invalid bind address %s\n",
 	       bind_addr);
       close (listen_fd);
       return 70;
@@ -531,14 +531,14 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 
   if (bind (listen_fd, (struct sockaddr *) &addr, sizeof addr) < 0)
     {
-      fprintf (stderr, "tai: tcsh --listen: bind %s:%d: %s\n",
+      fprintf (stderr, "tai: ksh --listen: bind %s:%d: %s\n",
 	       bind_addr, port, strerror (errno));
       close (listen_fd);
       return 70;
     }
   if (listen (listen_fd, 4) < 0)
     {
-      fprintf (stderr, "tai: tcsh --listen: listen: %s\n",
+      fprintf (stderr, "tai: ksh --listen: listen: %s\n",
 	       strerror (errno));
       close (listen_fd);
       return 70;
@@ -549,10 +549,10 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
      bytes to/from a remote nc) might be reading.
 
      mcp-bridge.py's wait_for_listener greps this line for the
-     literal "tcsh listening on" to know the bind() → listen()
+     literal "ksh listening on" to know the bind() → listen()
      chain has completed, so that substring is load-bearing. */
   fprintf (stderr,
-	   "tai: tcsh listening on %s:%d (concurrent sessions)%s\n",
+	   "tai: ksh listening on %s:%d (concurrent sessions)%s\n",
 	   bind_addr, port,
 	   token ? " — token required" : "");
   fflush (stderr);
@@ -611,7 +611,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 	{
 	  if (errno == EINTR || errno == ECONNABORTED)
 	    continue;
-	  fprintf (stderr, "tai: tcsh --listen: accept: %s\n",
+	  fprintf (stderr, "tai: ksh --listen: accept: %s\n",
 		   strerror (errno));
 	  close (listen_fd);
 	  return 70;
@@ -640,7 +640,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
       pid_t pid = fork ();
       if (pid < 0)
 	{
-	  fprintf (stderr, "tai: tcsh --listen: fork: %s\n",
+	  fprintf (stderr, "tai: ksh --listen: fork: %s\n",
 		   strerror (errno));
 	  close (conn_fd);
 	  continue;
@@ -666,7 +666,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
 	     the dup happens too late. */
 	  if (dup2 (conn_fd, 0) < 0 || dup2 (conn_fd, 1) < 0)
 	    {
-	      fprintf (stderr, "tai: tcsh --listen: dup2: %s\n",
+	      fprintf (stderr, "tai: ksh --listen: dup2: %s\n",
 		       strerror (errno));
 	      _exit (70);
 	    }
@@ -692,7 +692,7 @@ tai_embedded_serve_tcp (const char *bind_addr, int port,
       /* Monotonic count of sessions started, not a live count: with
 	 SIGCHLD ignored we get no exit notification, so anything
 	 claiming to be "currently live" here would drift. Use
-	 `pgrep -f "tcsh --listen"` on the host for the real picture. */
+	 `pgrep -f "ksh --listen"` on the host for the real picture. */
       sessions_started++;
       fprintf (stderr,
 	       "tai: session %d started (#%lu since boot); still "
