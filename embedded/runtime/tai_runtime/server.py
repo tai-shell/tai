@@ -99,7 +99,8 @@ _templates_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Desktop lock — arbitrates the one physical screen between sessions.
 #
-# `tcsh --listen` now serves sessions CONCURRENTLY (it forks per
+# `ksh --listen` (the control-shell listener) now serves sessions
+# CONCURRENTLY (it forks per
 # connection and no longer waits one out before accepting the next), so
 # two Claude sessions can be attached to the same host at the same time.
 # The transport handles that fine. The desktop does not: there is one

@@ -49,7 +49,8 @@ extern int tai_embedded_serve_stdio (void);
    This function only returns on an unrecoverable error (bind/listen/
    accept failure); a healthy listener runs until killed.
 
-   Used only by `tcsh --listen PORT [--bind ADDR] [--token T]`.
+   Used only under a control-shell name (`ksh`/`tcsh`) with
+   `--listen PORT [--bind ADDR] [--token T]`.
    bind_addr defaults to "127.0.0.1" at the caller. token may be
    NULL — in which case the handshake only checks the magic
    prefix. The wire format on connect:
