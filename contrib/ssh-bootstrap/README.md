@@ -57,22 +57,53 @@ claude ──► mcp-bridge.py
                    stdio relay                               Terminal.app TCC)
 ```
 
-`tcsh --listen` runs a **serial accept loop**: it serves one session at
-a time (sessions drive singleton resources — the SikuliX JVM, the mouse,
-the keyboard), but the listening socket outlives each session, so a
-client whose connection drops can simply reconnect. It forks per
+`tcsh --listen` runs a **concurrent accept loop**: the listening socket
+outlives each session, so a client whose connection drops can simply
+reconnect, *and* a second client can attach while the first is still
+being served. That is what lets two Claude sessions share one host. It forks per
 session, so each one gets a pristine interpreter and the SikuliX JVM is
-reaped when that session ends. A failed handshake drops that connection
-and keeps listening rather than killing the listener.
+reaped when that session ends.
 
-This matters because the connection runs over an `ssh -L` tunnel: a
-tunnel hiccup used to be terminal, leaving a wedged `tcsh` on Host B
-that had to be killed by hand before the next session could start.
+Transport-level concurrency does **not** make the desktop safe to drive
+from two sessions at once — there is one mouse, one keyboard, one front
+window. Arbitration lives in `tai_runtime.server`'s **desktop lock**: an
+`fcntl.flock` on `/tmp/tai-desktop.lock` (inter-process, because each
+session is a separate forked process) that serializes mutating tools —
+`screen_*`, `app_activate`, `browser_*` writes, `ui_template_capture`
+/`ui_template_click` — while leaving read-only ones (`screen_shot`,
+`*_list`, `*_find`, `doctor`) parallel. A session that can't get the
+desktop within `TAI_DESKTOP_LOCK_TIMEOUT` (default 60s) gets an error
+naming the holder rather than silently interleaving. The kernel drops
+the lock if a session dies, so there is no stale lock to clear.
 
-Each Claude session still re-fires `bootstrap.sh` for a fresh listener
-+ fresh token. Re-running `bootstrap.sh` is idempotent: the launcher
-kills any prior tcsh listener before starting a new one (it holds the
-port, and its old token wouldn't match anyway).
+### Attaching a second session
+
+`mcp-bridge.py` probes for a live listener before bootstrapping. If it
+finds one (plus a readable token), it **attaches**: it does not re-ship
+the binary, does not re-fire the launcher, and shares the running
+token — because the listener only validates the token it was started
+with. The local end of the tunnel falls back to an ephemeral port when
+the conventional one is already held by the first session's tunnel.
+
+An attached session never cleans up the remote, and the owning session
+skips the wipe while anyone else is still attached, so neither can pull
+the host out from under the other. Set `TAI_BRIDGE_ATTACH=never` to
+force a full bootstrap (which kills any existing session), or
+`=only` to fail rather than bootstrap.
+
+A failed handshake drops that one connection and keeps the listener
+running, rather than killing it.
+
+All of this matters because the connection runs over an `ssh -L`
+tunnel: a tunnel hiccup used to be terminal, leaving a wedged `tcsh` on
+Host B that had to be killed by hand before the next session could
+start — and a second session used to `pkill` the first one's listener
+out from under it and then die itself on the local port collision.
+
+`bootstrap.sh` (the optional manual path) is unchanged and still
+non-idempotent in this respect: its launcher kills any prior listener
+before starting a new one. Use it to pre-warm or debug a host, not
+while a session you care about is live.
 
 Because the listener persists, it also relies on the far side noticing
 a dead client. Accepted sockets get TCP keepalive armed (~110s to reap

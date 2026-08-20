@@ -24,15 +24,22 @@ extern int tai_embedded_serve_stdio (void);
 
 /* Same loop, but reachable over TCP on bind_addr:port.
 
-   Runs a serial accept-and-fork loop: accept a client, run the
+   Runs a concurrent accept-and-fork loop: accept a client, run the
    magic-prefix + optional-token handshake, fork, and in the child
    dup2 the connection over fd 0/1 and hand off to
-   tai_embedded_serve_stdio(). The parent waits for that session to
-   end, then loops back to accept the next one — so a dropped
-   connection (ssh tunnel hiccup, client crash) is recoverable by
-   reconnecting instead of requiring the remote process to be killed
-   and re-bootstrapped. Sessions are serial, never concurrent, because
-   they drive singleton resources (SikuliX JVM, mouse, keyboard).
+   tai_embedded_serve_stdio(). The parent does NOT wait for the child;
+   it goes straight back to accept(). So a dropped connection (ssh
+   tunnel hiccup, client crash) is recoverable by reconnecting, and a
+   second client can attach while the first is still being served —
+   which is what lets two Claude sessions share one host.
+
+   Concurrency here is transport-level only. The desktop (mouse,
+   keyboard, front window) is still a singleton, and arbitration for it
+   lives in tai_runtime.server's inter-process desktop lock, which
+   serializes mutating tools across sessions while leaving read-only
+   ones parallel. Children are reaped via SIGCHLD=SIG_IGN; the child
+   restores SIG_DFL so its own subprocess handling (the SikuliX JVM)
+   still works.
 
    A failed handshake drops that one connection and keeps listening;
    it does not terminate the listener. Accepted connections get TCP
