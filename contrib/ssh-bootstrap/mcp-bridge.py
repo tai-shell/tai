@@ -473,7 +473,16 @@ def probe_remote_session(target: str, port: int) -> tuple[str, str | None]:
         f">/dev/null 2>&1 || exit 9; "
         f"cat {DEFAULT_TOKEN_PATH} 2>/dev/null; "
         f"echo '---'; "
-        f"grep -o 'ksh listening on[^\\n]*' {DEFAULT_REMOTE_LOG_PATH} "
+        # Return the whole banner LINE, not `grep -o` with a character
+        # class. `[^\\n]*` does NOT mean "rest of line" — inside a grep
+        # bracket expression `\\n` is the two characters backslash and
+        # 'n', so `[^...n...]*` stops at the first literal 'n'. On the
+        # real banner that 'n' lands inside "co(n)current", truncating
+        # the match to "...(co" — so the "concurrent sessions" test
+        # below never matched and every live a40 listener was
+        # misclassified `legacy`, refusing every attach. grep is
+        # line-oriented, so a plain match returns the full line.
+        f"grep 'ksh listening on' {DEFAULT_REMOTE_LOG_PATH} "
         f"2>/dev/null | tail -1",
         timeout=20.0,
     )
